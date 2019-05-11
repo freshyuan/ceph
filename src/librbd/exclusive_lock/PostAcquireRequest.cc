@@ -108,9 +108,9 @@ void PostAcquireRequest<I>::send_open_journal() {
 
   bool journal_enabled;
   {
-    RWLock::RLocker snap_locker(m_image_ctx.snap_lock);
+    RWLock::RLocker image_locker(m_image_ctx.image_lock);
     journal_enabled = (m_image_ctx.test_features(RBD_FEATURE_JOURNALING,
-                                                 m_image_ctx.snap_lock) &&
+                                                 m_image_ctx.image_lock) &&
                        !m_image_ctx.get_journal_policy()->journal_disabled());
   }
   if (!journal_enabled) {
@@ -153,7 +153,7 @@ void PostAcquireRequest<I>::send_allocate_journal_tag() {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 10) << dendl;
 
-  RWLock::RLocker snap_locker(m_image_ctx.snap_lock);
+  RWLock::RLocker image_locker(m_image_ctx.image_lock);
   using klass = PostAcquireRequest<I>;
   Context *ctx = create_context_callback<
     klass, &klass::handle_allocate_journal_tag>(this);
@@ -225,10 +225,15 @@ void PostAcquireRequest<I>::handle_open_object_map(int r) {
 
   if (r < 0) {
     lderr(cct) << "failed to open object map: " << cpp_strerror(r) << dendl;
-
-    r = 0;
     delete m_object_map;
     m_object_map = nullptr;
+
+    if (r != -EFBIG) {
+      save_result(r);
+      revert();
+      finish();
+      return;
+    }
   }
 
   send_open_journal();
@@ -256,8 +261,10 @@ void PostAcquireRequest<I>::handle_close_object_map(int r) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 10) << "r=" << r << dendl;
 
-  // object map should never result in an error
-  assert(r == 0);
+  if (r < 0) {
+    lderr(cct) << "failed to close object map: " << cpp_strerror(r) << dendl;
+  }
+
   revert();
   finish();
 }
@@ -265,11 +272,11 @@ void PostAcquireRequest<I>::handle_close_object_map(int r) {
 template <typename I>
 void PostAcquireRequest<I>::apply() {
   {
-    RWLock::WLocker snap_locker(m_image_ctx.snap_lock);
-    assert(m_image_ctx.object_map == nullptr);
+    RWLock::WLocker image_locker(m_image_ctx.image_lock);
+    ceph_assert(m_image_ctx.object_map == nullptr);
     m_image_ctx.object_map = m_object_map;
 
-    assert(m_image_ctx.journal == nullptr);
+    ceph_assert(m_image_ctx.journal == nullptr);
     m_image_ctx.journal = m_journal;
   }
 
@@ -279,14 +286,14 @@ void PostAcquireRequest<I>::apply() {
 
 template <typename I>
 void PostAcquireRequest<I>::revert() {
-  RWLock::WLocker snap_locker(m_image_ctx.snap_lock);
+  RWLock::WLocker image_locker(m_image_ctx.image_lock);
   m_image_ctx.object_map = nullptr;
   m_image_ctx.journal = nullptr;
 
   delete m_object_map;
   delete m_journal;
 
-  assert(m_error_result < 0);
+  ceph_assert(m_error_result < 0);
 }
 
 template <typename I>

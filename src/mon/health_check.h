@@ -33,7 +33,7 @@ struct health_check_t {
     return !(l == r);
   }
 
-  void dump(Formatter *f) const {
+  void dump(ceph::Formatter *f) const {
     f->dump_stream("severity") << severity;
 
     f->open_object_section("summary");
@@ -49,7 +49,7 @@ struct health_check_t {
     f->close_section();
   }
 
-  static void generate_test_instances(list<health_check_t*>& ls) {
+  static void generate_test_instances(std::list<health_check_t*>& ls) {
     ls.push_back(new health_check_t);
     ls.push_back(new health_check_t);
     ls.back()->severity = HEALTH_ERR;
@@ -61,7 +61,7 @@ WRITE_CLASS_DENC(health_check_t)
 
 
 struct health_check_map_t {
-  map<std::string,health_check_t> checks;
+  std::map<std::string,health_check_t> checks;
 
   DENC(health_check_map_t, v, p) {
     DENC_START(1, 1, p);
@@ -69,13 +69,13 @@ struct health_check_map_t {
     DENC_FINISH(p);
   }
 
-  void dump(Formatter *f) const {
+  void dump(ceph::Formatter *f) const {
     for (auto& p : checks) {
       f->dump_object(p.first.c_str(), p.second);
     }
   }
 
-  static void generate_test_instances(list<health_check_map_t*>& ls) {
+  static void generate_test_instances(std::list<health_check_map_t*>& ls) {
     ls.push_back(new health_check_map_t);
     ls.push_back(new health_check_map_t);
     {
@@ -103,7 +103,7 @@ struct health_check_map_t {
   health_check_t& add(const std::string& code,
 		      health_status_t severity,
 		      const std::string& summary) {
-    assert(checks.count(code) == 0);
+    ceph_assert(checks.count(code) == 0);
     health_check_t& r = checks[code];
     r.severity = severity;
     r.summary = summary;
@@ -134,7 +134,7 @@ struct health_check_map_t {
     }
   }
 
-  health_status_t dump_summary(Formatter *f, std::string *plain,
+  health_status_t dump_summary(ceph::Formatter *f, std::string *plain,
 			       const char *sep, bool detail) const {
     health_status_t r = HEALTH_OK;
     for (auto& p : checks) {
@@ -169,7 +169,7 @@ struct health_check_map_t {
     return r;
   }
 
-  void dump_summary_compat(Formatter *f) const {
+  void dump_summary_compat(ceph::Formatter *f) const {
     for (auto& p : checks) {
       f->open_object_section("item");
       f->dump_stream("severity") << p.second.severity;
@@ -178,27 +178,13 @@ struct health_check_map_t {
     }
   }
 
-  void dump_detail(Formatter *f, std::string *plain, bool compat) const {
+  void dump_detail(std::string *plain) const {
     for (auto& p : checks) {
-      if (f) {
-	if (compat) {
-	  // this is sloppy, but the best we can do: just dump all of the
-	  // individual checks' details together
-	  for (auto& d : p.second.detail) {
-	    f->dump_string("item", d);
-	  }
-	}
-      } else {
-	if (!compat) {
-	  *plain += p.first + " " + p.second.summary + "\n";
-	}
-	for (auto& d : p.second.detail) {
-	  if (!compat) {
-	    *plain += "    ";
-	  }
-	  *plain += d;
-	  *plain += "\n";
-	}
+      *plain += p.first + " " + p.second.summary + "\n";
+      for (auto& d : p.second.detail) {
+        *plain += "    ";
+        *plain += d;
+        *plain += "\n";
       }
     }
   }

@@ -1,8 +1,0 @@
-meta:
-- desc: install ceph/luminous latest
-tasks:
-- install:
-    branch: luminous
-- print: "**** done install luminous"
-- ceph:
-- print: "**** done ceph"

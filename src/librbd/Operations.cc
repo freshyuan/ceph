@@ -5,7 +5,9 @@
 #include "librbd/Operations.h"
 #include "common/dout.h"
 #include "common/errno.h"
+#include "common/perf_counters.h"
 #include "common/WorkQueue.h"
+#include "osdc/Striper.h"
 
 #include "librbd/ExclusiveLock.h"
 #include "librbd/ImageCtx.h"
@@ -14,6 +16,7 @@
 #include "librbd/ObjectMap.h"
 #include "librbd/Types.h"
 #include "librbd/Utils.h"
+#include "librbd/api/Config.h"
 #include "librbd/journal/DisabledPolicy.h"
 #include "librbd/journal/StandardPolicy.h"
 #include "librbd/operation/DisableFeaturesRequest.h"
@@ -21,6 +24,7 @@
 #include "librbd/operation/FlattenRequest.h"
 #include "librbd/operation/MetadataRemoveRequest.h"
 #include "librbd/operation/MetadataSetRequest.h"
+#include "librbd/operation/MigrateRequest.h"
 #include "librbd/operation/ObjectMapIterate.h"
 #include "librbd/operation/RebuildObjectMapRequest.h"
 #include "librbd/operation/RenameRequest.h"
@@ -32,6 +36,7 @@
 #include "librbd/operation/SnapshotRollbackRequest.h"
 #include "librbd/operation/SnapshotUnprotectRequest.h"
 #include "librbd/operation/SnapshotLimitRequest.h"
+#include "librbd/operation/SparsifyRequest.h"
 #include <set>
 #include <boost/bind.hpp>
 #include <boost/scope_exit.hpp>
@@ -173,15 +178,15 @@ struct C_InvokeAsyncRequest : public Context {
     // context can complete before owner_lock is unlocked
     RWLock &owner_lock(image_ctx.owner_lock);
     owner_lock.get_read();
-    image_ctx.snap_lock.get_read();
+    image_ctx.image_lock.get_read();
     if (image_ctx.read_only ||
         (!permit_snapshot && image_ctx.snap_id != CEPH_NOSNAP)) {
-      image_ctx.snap_lock.put_read();
+      image_ctx.image_lock.put_read();
       owner_lock.put_read();
       complete(-EROFS);
       return;
     }
-    image_ctx.snap_lock.put_read();
+    image_ctx.image_lock.put_read();
 
     if (image_ctx.exclusive_lock == nullptr) {
       send_local_request();
@@ -224,14 +229,15 @@ struct C_InvokeAsyncRequest : public Context {
     ldout(cct, 20) << __func__ << ": r=" << r << dendl;
 
     if (r < 0) {
-      complete(-EROFS);
+      complete(r == -EBLACKLISTED ? -EBLACKLISTED : -EROFS);
       return;
     }
 
     // context can complete before owner_lock is unlocked
     RWLock &owner_lock(image_ctx.owner_lock);
     owner_lock.get_read();
-    if (image_ctx.exclusive_lock->is_lock_owner()) {
+    if (image_ctx.exclusive_lock == nullptr ||
+        image_ctx.exclusive_lock->is_lock_owner()) {
       send_local_request();
       owner_lock.put_read();
       return;
@@ -242,14 +248,15 @@ struct C_InvokeAsyncRequest : public Context {
   }
 
   void send_remote_request() {
-    assert(image_ctx.owner_lock.is_locked());
+    ceph_assert(image_ctx.owner_lock.is_locked());
 
     CephContext *cct = image_ctx.cct;
     ldout(cct, 20) << __func__ << dendl;
 
-    Context *ctx = util::create_context_callback<
-      C_InvokeAsyncRequest<I>, &C_InvokeAsyncRequest<I>::handle_remote_request>(
-        this);
+    Context *ctx = util::create_async_context_callback(
+      image_ctx, util::create_context_callback<
+        C_InvokeAsyncRequest<I>,
+        &C_InvokeAsyncRequest<I>::handle_remote_request>(this));
     remote(ctx);
   }
 
@@ -276,7 +283,7 @@ struct C_InvokeAsyncRequest : public Context {
   }
 
   void send_local_request() {
-    assert(image_ctx.owner_lock.is_locked());
+    ceph_assert(image_ctx.owner_lock.is_locked());
 
     CephContext *cct = image_ctx.cct;
     ldout(cct, 20) << __func__ << dendl;
@@ -341,7 +348,7 @@ int Operations<I>::flatten(ProgressContext &prog_ctx) {
   }
 
   {
-    RWLock::RLocker parent_locker(m_image_ctx.parent_lock);
+    RWLock::RLocker image_locker(m_image_ctx.image_lock);
     if (m_image_ctx.parent_md.spec.pool_id == -1) {
       lderr(cct) << "image has no parent" << dendl;
       return -EINVAL;
@@ -366,55 +373,49 @@ int Operations<I>::flatten(ProgressContext &prog_ctx) {
 template <typename I>
 void Operations<I>::execute_flatten(ProgressContext &prog_ctx,
                                     Context *on_finish) {
-  assert(m_image_ctx.owner_lock.is_locked());
-  assert(m_image_ctx.exclusive_lock == nullptr ||
-         m_image_ctx.exclusive_lock->is_lock_owner());
+  ceph_assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(m_image_ctx.exclusive_lock == nullptr ||
+              m_image_ctx.exclusive_lock->is_lock_owner());
 
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 20) << "flatten" << dendl;
 
-  if (m_image_ctx.read_only) {
+  if (m_image_ctx.read_only || m_image_ctx.operations_disabled) {
     on_finish->complete(-EROFS);
     return;
   }
 
-  m_image_ctx.snap_lock.get_read();
-  m_image_ctx.parent_lock.get_read();
+  m_image_ctx.image_lock.get_read();
 
   // can't flatten a non-clone
   if (m_image_ctx.parent_md.spec.pool_id == -1) {
     lderr(cct) << "image has no parent" << dendl;
-    m_image_ctx.parent_lock.put_read();
-    m_image_ctx.snap_lock.put_read();
+    m_image_ctx.image_lock.put_read();
     on_finish->complete(-EINVAL);
     return;
   }
   if (m_image_ctx.snap_id != CEPH_NOSNAP) {
     lderr(cct) << "snapshots cannot be flattened" << dendl;
-    m_image_ctx.parent_lock.put_read();
-    m_image_ctx.snap_lock.put_read();
+    m_image_ctx.image_lock.put_read();
     on_finish->complete(-EROFS);
     return;
   }
 
   ::SnapContext snapc = m_image_ctx.snapc;
-  assert(m_image_ctx.parent != NULL);
 
   uint64_t overlap;
   int r = m_image_ctx.get_parent_overlap(CEPH_NOSNAP, &overlap);
-  assert(r == 0);
-  assert(overlap <= m_image_ctx.size);
+  ceph_assert(r == 0);
+  ceph_assert(overlap <= m_image_ctx.size);
 
-  uint64_t object_size = m_image_ctx.get_object_size();
-  uint64_t  overlap_objects = Striper::get_num_objects(m_image_ctx.layout,
-                                                       overlap);
+  uint64_t overlap_objects = Striper::get_num_objects(m_image_ctx.layout,
+                                                      overlap);
 
-  m_image_ctx.parent_lock.put_read();
-  m_image_ctx.snap_lock.put_read();
+  m_image_ctx.image_lock.put_read();
 
   operation::FlattenRequest<I> *req = new operation::FlattenRequest<I>(
-    m_image_ctx, new C_NotifyUpdate<I>(m_image_ctx, on_finish), object_size,
-    overlap_objects, snapc, prog_ctx);
+    m_image_ctx, new C_NotifyUpdate<I>(m_image_ctx, on_finish), overlap_objects,
+    snapc, prog_ctx);
   req->send();
 }
 
@@ -446,17 +447,18 @@ int Operations<I>::rebuild_object_map(ProgressContext &prog_ctx) {
 template <typename I>
 void Operations<I>::execute_rebuild_object_map(ProgressContext &prog_ctx,
                                                Context *on_finish) {
-  assert(m_image_ctx.owner_lock.is_locked());
-  assert(m_image_ctx.exclusive_lock == nullptr ||
-         m_image_ctx.exclusive_lock->is_lock_owner());
+  ceph_assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(m_image_ctx.exclusive_lock == nullptr ||
+              m_image_ctx.exclusive_lock->is_lock_owner());
 
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << dendl;
 
-  if (m_image_ctx.read_only) {
+  if (m_image_ctx.read_only || m_image_ctx.operations_disabled) {
     on_finish->complete(-EROFS);
     return;
   }
+
   if (!m_image_ctx.test_features(RBD_FEATURE_OBJECT_MAP)) {
     lderr(cct) << "image must support object-map feature" << dendl;
     on_finish->complete(-EINVAL);
@@ -481,7 +483,9 @@ int Operations<I>::check_object_map(ProgressContext &prog_ctx) {
   r = invoke_async_request("check object map", true,
                            boost::bind(&Operations<I>::check_object_map, this,
                                        boost::ref(prog_ctx), _1),
-			   [] (Context *c) { c->complete(-EOPNOTSUPP); });
+			   [this](Context *c) {
+                             m_image_ctx.op_work_queue->queue(c, -EOPNOTSUPP);
+                           });
 
   return r;
 }
@@ -490,9 +494,9 @@ template <typename I>
 void Operations<I>::object_map_iterate(ProgressContext &prog_ctx,
 				       operation::ObjectIterateWork<I> handle_mismatch,
 				       Context *on_finish) {
-  assert(m_image_ctx.owner_lock.is_locked());
-  assert(m_image_ctx.exclusive_lock == nullptr ||
-         m_image_ctx.exclusive_lock->is_lock_owner());
+  ceph_assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(m_image_ctx.exclusive_lock == nullptr ||
+              m_image_ctx.exclusive_lock->is_lock_owner());
 
   if (!m_image_ctx.test_features(RBD_FEATURE_OBJECT_MAP)) {
     on_finish->complete(-EINVAL);
@@ -558,19 +562,24 @@ int Operations<I>::rename(const char *dstname) {
 template <typename I>
 void Operations<I>::execute_rename(const std::string &dest_name,
                                    Context *on_finish) {
-  assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(m_image_ctx.owner_lock.is_locked());
   if (m_image_ctx.test_features(RBD_FEATURE_JOURNALING)) {
-    assert(m_image_ctx.exclusive_lock == nullptr ||
-           m_image_ctx.exclusive_lock->is_lock_owner());
+    ceph_assert(m_image_ctx.exclusive_lock == nullptr ||
+                m_image_ctx.exclusive_lock->is_lock_owner());
   }
 
-  m_image_ctx.snap_lock.get_read();
+  if (m_image_ctx.operations_disabled) {
+    on_finish->complete(-EROFS);
+    return;
+  }
+
+  m_image_ctx.image_lock.get_read();
   if (m_image_ctx.name == dest_name) {
-    m_image_ctx.snap_lock.put_read();
+    m_image_ctx.image_lock.put_read();
     on_finish->complete(-EEXIST);
     return;
   }
-  m_image_ctx.snap_lock.put_read();
+  m_image_ctx.image_lock.put_read();
 
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": dest_name=" << dest_name
@@ -603,11 +612,11 @@ template <typename I>
 int Operations<I>::resize(uint64_t size, bool allow_shrink, ProgressContext& prog_ctx) {
   CephContext *cct = m_image_ctx.cct;
 
-  m_image_ctx.snap_lock.get_read();
+  m_image_ctx.image_lock.get_read();
   ldout(cct, 5) << this << " " << __func__ << ": "
                 << "size=" << m_image_ctx.size << ", "
                 << "new_size=" << size << dendl;
-  m_image_ctx.snap_lock.put_read();
+  m_image_ctx.image_lock.put_read();
 
   int r = m_image_ctx.state->refresh_if_required();
   if (r < 0) {
@@ -637,28 +646,29 @@ template <typename I>
 void Operations<I>::execute_resize(uint64_t size, bool allow_shrink, ProgressContext &prog_ctx,
                                    Context *on_finish,
                                    uint64_t journal_op_tid) {
-  assert(m_image_ctx.owner_lock.is_locked());
-  assert(m_image_ctx.exclusive_lock == nullptr ||
-         m_image_ctx.exclusive_lock->is_lock_owner());
+  ceph_assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(m_image_ctx.exclusive_lock == nullptr ||
+              m_image_ctx.exclusive_lock->is_lock_owner());
 
   CephContext *cct = m_image_ctx.cct;
-  m_image_ctx.snap_lock.get_read();
+  m_image_ctx.image_lock.get_read();
   ldout(cct, 5) << this << " " << __func__ << ": "
                 << "size=" << m_image_ctx.size << ", "
                 << "new_size=" << size << dendl;
 
-  if (m_image_ctx.snap_id != CEPH_NOSNAP || m_image_ctx.read_only) {
-    m_image_ctx.snap_lock.put_read();
+  if (m_image_ctx.snap_id != CEPH_NOSNAP || m_image_ctx.read_only ||
+      m_image_ctx.operations_disabled) {
+    m_image_ctx.image_lock.put_read();
     on_finish->complete(-EROFS);
     return;
   } else if (m_image_ctx.test_features(RBD_FEATURE_OBJECT_MAP,
-                                       m_image_ctx.snap_lock) &&
+                                       m_image_ctx.image_lock) &&
              !ObjectMap<>::is_compatible(m_image_ctx.layout, size)) {
-    m_image_ctx.snap_lock.put_read();
+    m_image_ctx.image_lock.put_read();
     on_finish->complete(-EINVAL);
     return;
   }
-  m_image_ctx.snap_lock.put_read();
+  m_image_ctx.image_lock.put_read();
 
   operation::ResizeRequest<I> *req = new operation::ResizeRequest<I>(
     m_image_ctx, new C_NotifyUpdate<I>(m_image_ctx, on_finish), size, allow_shrink,
@@ -668,7 +678,7 @@ void Operations<I>::execute_resize(uint64_t size, bool allow_shrink, ProgressCon
 
 template <typename I>
 int Operations<I>::snap_create(const cls::rbd::SnapshotNamespace &snap_namespace,
-			       const char *snap_name) {
+			       const std::string& snap_name) {
   if (m_image_ctx.read_only) {
     return -EROFS;
   }
@@ -692,7 +702,7 @@ int Operations<I>::snap_create(const cls::rbd::SnapshotNamespace &snap_namespace
 
 template <typename I>
 void Operations<I>::snap_create(const cls::rbd::SnapshotNamespace &snap_namespace,
-				const char *snap_name,
+				const std::string& snap_name,
 				Context *on_finish) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": snap_name=" << snap_name
@@ -703,13 +713,13 @@ void Operations<I>::snap_create(const cls::rbd::SnapshotNamespace &snap_namespac
     return;
   }
 
-  m_image_ctx.snap_lock.get_read();
+  m_image_ctx.image_lock.get_read();
   if (m_image_ctx.get_snap_id(snap_namespace, snap_name) != CEPH_NOSNAP) {
-    m_image_ctx.snap_lock.put_read();
+    m_image_ctx.image_lock.put_read();
     on_finish->complete(-EEXIST);
     return;
   }
-  m_image_ctx.snap_lock.put_read();
+  m_image_ctx.image_lock.put_read();
 
   C_InvokeAsyncRequest<I> *req = new C_InvokeAsyncRequest<I>(
     m_image_ctx, "snap_create", true,
@@ -727,21 +737,26 @@ void Operations<I>::execute_snap_create(const cls::rbd::SnapshotNamespace &snap_
                                         Context *on_finish,
                                         uint64_t journal_op_tid,
                                         bool skip_object_map) {
-  assert(m_image_ctx.owner_lock.is_locked());
-  assert(m_image_ctx.exclusive_lock == nullptr ||
-         m_image_ctx.exclusive_lock->is_lock_owner());
+  ceph_assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(m_image_ctx.exclusive_lock == nullptr ||
+              m_image_ctx.exclusive_lock->is_lock_owner());
 
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": snap_name=" << snap_name
                 << dendl;
 
-  m_image_ctx.snap_lock.get_read();
+  if (m_image_ctx.operations_disabled) {
+    on_finish->complete(-EROFS);
+    return;
+  }
+
+  m_image_ctx.image_lock.get_read();
   if (m_image_ctx.get_snap_id(snap_namespace, snap_name) != CEPH_NOSNAP) {
-    m_image_ctx.snap_lock.put_read();
+    m_image_ctx.image_lock.put_read();
     on_finish->complete(-EEXIST);
     return;
   }
-  m_image_ctx.snap_lock.put_read();
+  m_image_ctx.image_lock.put_read();
 
   operation::SnapshotCreateRequest<I> *req =
     new operation::SnapshotCreateRequest<I>(
@@ -752,7 +767,7 @@ void Operations<I>::execute_snap_create(const cls::rbd::SnapshotNamespace &snap_
 
 template <typename I>
 int Operations<I>::snap_rollback(const cls::rbd::SnapshotNamespace& snap_namespace,
-				 const char *snap_name,
+				 const std::string& snap_name,
                                  ProgressContext& prog_ctx) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": snap_name=" << snap_name
@@ -766,8 +781,8 @@ int Operations<I>::snap_rollback(const cls::rbd::SnapshotNamespace& snap_namespa
   {
     RWLock::RLocker owner_locker(m_image_ctx.owner_lock);
     {
-      // need to drop snap_lock before invalidating cache
-      RWLock::RLocker snap_locker(m_image_ctx.snap_lock);
+      // need to drop image_lock before invalidating cache
+      RWLock::RLocker image_locker(m_image_ctx.image_lock);
       if (!m_image_ctx.snap_exists) {
         return -ENOENT;
       }
@@ -785,7 +800,7 @@ int Operations<I>::snap_rollback(const cls::rbd::SnapshotNamespace& snap_namespa
 
     r = prepare_image_update(false);
     if (r < 0) {
-      return -EROFS;
+      return r;
     }
 
     execute_snap_rollback(snap_namespace, snap_name, prog_ctx, &cond_ctx);
@@ -805,22 +820,27 @@ void Operations<I>::execute_snap_rollback(const cls::rbd::SnapshotNamespace& sna
 					  const std::string &snap_name,
                                           ProgressContext& prog_ctx,
                                           Context *on_finish) {
-  assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(m_image_ctx.owner_lock.is_locked());
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": snap_name=" << snap_name
                 << dendl;
 
-  m_image_ctx.snap_lock.get_read();
+  if (m_image_ctx.operations_disabled) {
+    on_finish->complete(-EROFS);
+    return;
+  }
+
+  m_image_ctx.image_lock.get_read();
   uint64_t snap_id = m_image_ctx.get_snap_id(snap_namespace, snap_name);
   if (snap_id == CEPH_NOSNAP) {
     lderr(cct) << "No such snapshot found." << dendl;
-    m_image_ctx.snap_lock.put_read();
+    m_image_ctx.image_lock.put_read();
     on_finish->complete(-ENOENT);
     return;
   }
 
   uint64_t new_size = m_image_ctx.get_image_size(snap_id);
-  m_image_ctx.snap_lock.put_read();
+  m_image_ctx.image_lock.put_read();
 
   // async mode used for journal replay
   operation::SnapshotRollbackRequest<I> *request =
@@ -832,7 +852,7 @@ void Operations<I>::execute_snap_rollback(const cls::rbd::SnapshotNamespace& sna
 
 template <typename I>
 int Operations<I>::snap_remove(const cls::rbd::SnapshotNamespace& snap_namespace,
-			       const char *snap_name) {
+			       const std::string& snap_name) {
   if (m_image_ctx.read_only) {
     return -EROFS;
   }
@@ -856,7 +876,7 @@ int Operations<I>::snap_remove(const cls::rbd::SnapshotNamespace& snap_namespace
 
 template <typename I>
 void Operations<I>::snap_remove(const cls::rbd::SnapshotNamespace& snap_namespace,
-				const char *snap_name,
+				const std::string& snap_name,
 				Context *on_finish) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": snap_name=" << snap_name
@@ -868,16 +888,16 @@ void Operations<I>::snap_remove(const cls::rbd::SnapshotNamespace& snap_namespac
   }
 
   // quickly filter out duplicate ops
-  m_image_ctx.snap_lock.get_read();
+  m_image_ctx.image_lock.get_read();
   if (m_image_ctx.get_snap_id(snap_namespace, snap_name) == CEPH_NOSNAP) {
-    m_image_ctx.snap_lock.put_read();
+    m_image_ctx.image_lock.put_read();
     on_finish->complete(-ENOENT);
     return;
   }
 
   bool proxy_op = ((m_image_ctx.features & RBD_FEATURE_FAST_DIFF) != 0 ||
                    (m_image_ctx.features & RBD_FEATURE_JOURNALING) != 0);
-  m_image_ctx.snap_lock.put_read();
+  m_image_ctx.image_lock.put_read();
 
   if (proxy_op) {
     C_InvokeAsyncRequest<I> *req = new C_InvokeAsyncRequest<I>(
@@ -897,11 +917,11 @@ template <typename I>
 void Operations<I>::execute_snap_remove(const cls::rbd::SnapshotNamespace& snap_namespace,
 					const std::string &snap_name,
                                         Context *on_finish) {
-  assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(m_image_ctx.owner_lock.is_locked());
   {
     if ((m_image_ctx.features & RBD_FEATURE_FAST_DIFF) != 0) {
-      assert(m_image_ctx.exclusive_lock == nullptr ||
-             m_image_ctx.exclusive_lock->is_lock_owner());
+      ceph_assert(m_image_ctx.exclusive_lock == nullptr ||
+                  m_image_ctx.exclusive_lock->is_lock_owner());
     }
   }
 
@@ -909,11 +929,16 @@ void Operations<I>::execute_snap_remove(const cls::rbd::SnapshotNamespace& snap_
   ldout(cct, 5) << this << " " << __func__ << ": snap_name=" << snap_name
                 << dendl;
 
-  m_image_ctx.snap_lock.get_read();
+  if (m_image_ctx.operations_disabled) {
+    on_finish->complete(-EROFS);
+    return;
+  }
+
+  m_image_ctx.image_lock.get_read();
   uint64_t snap_id = m_image_ctx.get_snap_id(snap_namespace, snap_name);
   if (snap_id == CEPH_NOSNAP) {
     lderr(m_image_ctx.cct) << "No such snapshot found." << dendl;
-    m_image_ctx.snap_lock.put_read();
+    m_image_ctx.image_lock.put_read();
     on_finish->complete(-ENOENT);
     return;
   }
@@ -921,16 +946,16 @@ void Operations<I>::execute_snap_remove(const cls::rbd::SnapshotNamespace& snap_
   bool is_protected;
   int r = m_image_ctx.is_snap_protected(snap_id, &is_protected);
   if (r < 0) {
-    m_image_ctx.snap_lock.put_read();
+    m_image_ctx.image_lock.put_read();
     on_finish->complete(r);
     return;
   } else if (is_protected) {
     lderr(m_image_ctx.cct) << "snapshot is protected" << dendl;
-    m_image_ctx.snap_lock.put_read();
+    m_image_ctx.image_lock.put_read();
     on_finish->complete(-EBUSY);
     return;
   }
-  m_image_ctx.snap_lock.put_read();
+  m_image_ctx.image_lock.put_read();
 
   operation::SnapshotRemoveRequest<I> *req =
     new operation::SnapshotRemoveRequest<I>(
@@ -956,7 +981,7 @@ int Operations<I>::snap_rename(const char *srcname, const char *dstname) {
     return r;
 
   {
-    RWLock::RLocker l(m_image_ctx.snap_lock);
+    RWLock::RLocker l(m_image_ctx.image_lock);
     snap_id = m_image_ctx.get_snap_id(cls::rbd::UserSnapshotNamespace(), srcname);
     if (snap_id == CEPH_NOSNAP) {
       return -ENOENT;
@@ -997,21 +1022,26 @@ template <typename I>
 void Operations<I>::execute_snap_rename(const uint64_t src_snap_id,
                                         const std::string &dest_snap_name,
                                         Context *on_finish) {
-  assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(m_image_ctx.owner_lock.is_locked());
   if ((m_image_ctx.features & RBD_FEATURE_JOURNALING) != 0) {
-    assert(m_image_ctx.exclusive_lock == nullptr ||
-           m_image_ctx.exclusive_lock->is_lock_owner());
+    ceph_assert(m_image_ctx.exclusive_lock == nullptr ||
+                m_image_ctx.exclusive_lock->is_lock_owner());
   }
 
-  m_image_ctx.snap_lock.get_read();
+  if (m_image_ctx.operations_disabled) {
+    on_finish->complete(-EROFS);
+    return;
+  }
+
+  m_image_ctx.image_lock.get_read();
   if (m_image_ctx.get_snap_id(cls::rbd::UserSnapshotNamespace(),
 			      dest_snap_name) != CEPH_NOSNAP) {
     // Renaming is supported for snapshots from user namespace only.
-    m_image_ctx.snap_lock.put_read();
+    m_image_ctx.image_lock.put_read();
     on_finish->complete(-EEXIST);
     return;
   }
-  m_image_ctx.snap_lock.put_read();
+  m_image_ctx.image_lock.put_read();
 
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": "
@@ -1027,7 +1057,7 @@ void Operations<I>::execute_snap_rename(const uint64_t src_snap_id,
 
 template <typename I>
 int Operations<I>::snap_protect(const cls::rbd::SnapshotNamespace& snap_namespace,
-				const char *snap_name) {
+				const std::string& snap_name) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": snap_name=" << snap_name
                 << dendl;
@@ -1047,7 +1077,7 @@ int Operations<I>::snap_protect(const cls::rbd::SnapshotNamespace& snap_namespac
   }
 
   {
-    RWLock::RLocker snap_locker(m_image_ctx.snap_lock);
+    RWLock::RLocker image_locker(m_image_ctx.image_lock);
     bool is_protected;
     r = m_image_ctx.is_snap_protected(m_image_ctx.get_snap_id(snap_namespace, snap_name),
                                       &is_protected);
@@ -1089,26 +1119,31 @@ template <typename I>
 void Operations<I>::execute_snap_protect(const cls::rbd::SnapshotNamespace& snap_namespace,
 					 const std::string &snap_name,
                                          Context *on_finish) {
-  assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(m_image_ctx.owner_lock.is_locked());
   if (m_image_ctx.test_features(RBD_FEATURE_JOURNALING)) {
-    assert(m_image_ctx.exclusive_lock == nullptr ||
-           m_image_ctx.exclusive_lock->is_lock_owner());
+    ceph_assert(m_image_ctx.exclusive_lock == nullptr ||
+                m_image_ctx.exclusive_lock->is_lock_owner());
   }
 
-  m_image_ctx.snap_lock.get_read();
+  if (m_image_ctx.operations_disabled) {
+    on_finish->complete(-EROFS);
+    return;
+  }
+
+  m_image_ctx.image_lock.get_read();
   bool is_protected;
   int r = m_image_ctx.is_snap_protected(m_image_ctx.get_snap_id(snap_namespace, snap_name),
                                         &is_protected);
   if (r < 0) {
-    m_image_ctx.snap_lock.put_read();
+    m_image_ctx.image_lock.put_read();
     on_finish->complete(r);
     return;
   } else if (is_protected) {
-    m_image_ctx.snap_lock.put_read();
+    m_image_ctx.image_lock.put_read();
     on_finish->complete(-EBUSY);
     return;
   }
-  m_image_ctx.snap_lock.put_read();
+  m_image_ctx.image_lock.put_read();
 
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": snap_name=" << snap_name
@@ -1122,7 +1157,7 @@ void Operations<I>::execute_snap_protect(const cls::rbd::SnapshotNamespace& snap
 
 template <typename I>
 int Operations<I>::snap_unprotect(const cls::rbd::SnapshotNamespace& snap_namespace,
-				  const char *snap_name) {
+				  const std::string& snap_name) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": snap_name=" << snap_name
                 << dendl;
@@ -1137,7 +1172,7 @@ int Operations<I>::snap_unprotect(const cls::rbd::SnapshotNamespace& snap_namesp
   }
 
   {
-    RWLock::RLocker snap_locker(m_image_ctx.snap_lock);
+    RWLock::RLocker image_locker(m_image_ctx.image_lock);
     bool is_unprotected;
     r = m_image_ctx.is_snap_unprotected(m_image_ctx.get_snap_id(snap_namespace, snap_name),
                                   &is_unprotected);
@@ -1179,26 +1214,31 @@ template <typename I>
 void Operations<I>::execute_snap_unprotect(const cls::rbd::SnapshotNamespace& snap_namespace,
 					   const std::string &snap_name,
                                            Context *on_finish) {
-  assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(m_image_ctx.owner_lock.is_locked());
   if (m_image_ctx.test_features(RBD_FEATURE_JOURNALING)) {
-    assert(m_image_ctx.exclusive_lock == nullptr ||
-           m_image_ctx.exclusive_lock->is_lock_owner());
+    ceph_assert(m_image_ctx.exclusive_lock == nullptr ||
+                m_image_ctx.exclusive_lock->is_lock_owner());
   }
 
-  m_image_ctx.snap_lock.get_read();
+  if (m_image_ctx.operations_disabled) {
+    on_finish->complete(-EROFS);
+    return;
+  }
+
+  m_image_ctx.image_lock.get_read();
   bool is_unprotected;
   int r = m_image_ctx.is_snap_unprotected(m_image_ctx.get_snap_id(snap_namespace, snap_name),
                                           &is_unprotected);
   if (r < 0) {
-    m_image_ctx.snap_lock.put_read();
+    m_image_ctx.image_lock.put_read();
     on_finish->complete(r);
     return;
   } else if (is_unprotected) {
-    m_image_ctx.snap_lock.put_read();
+    m_image_ctx.image_lock.put_read();
     on_finish->complete(-EINVAL);
     return;
   }
-  m_image_ctx.snap_lock.put_read();
+  m_image_ctx.image_lock.put_read();
 
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": snap_name=" << snap_name
@@ -1242,7 +1282,7 @@ int Operations<I>::snap_set_limit(uint64_t limit) {
 template <typename I>
 void Operations<I>::execute_snap_set_limit(const uint64_t limit,
 					   Context *on_finish) {
-  assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(m_image_ctx.owner_lock.is_locked());
 
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": limit=" << limit
@@ -1278,12 +1318,23 @@ int Operations<I>::update_features(uint64_t features, bool enabled) {
     lderr(cct) << "cannot update immutable features" << dendl;
     return -EINVAL;
   }
+
+  bool set_object_map = (features & RBD_FEATURE_OBJECT_MAP) == RBD_FEATURE_OBJECT_MAP;
+  bool set_fast_diff = (features & RBD_FEATURE_FAST_DIFF) == RBD_FEATURE_FAST_DIFF;
+  bool exist_fast_diff = (m_image_ctx.features & RBD_FEATURE_FAST_DIFF) != 0;
+  bool exist_object_map = (m_image_ctx.features & RBD_FEATURE_OBJECT_MAP) != 0;
+
+  if ((enabled && ((set_object_map && !exist_fast_diff) || (set_fast_diff && !exist_object_map)))
+      || (!enabled && (set_object_map && exist_fast_diff))) {
+    features |= (RBD_FEATURE_OBJECT_MAP | RBD_FEATURE_FAST_DIFF);
+  }
+
   if (features == 0) {
     lderr(cct) << "update requires at least one feature" << dendl;
     return -EINVAL;
   }
   {
-    RWLock::RLocker snap_locker(m_image_ctx.snap_lock);
+    RWLock::RLocker image_locker(m_image_ctx.image_lock);
     if (enabled && (features & m_image_ctx.features) != 0) {
       lderr(cct) << "one or more requested features are already enabled"
 		 << dendl;
@@ -1300,24 +1351,43 @@ int Operations<I>::update_features(uint64_t features, bool enabled) {
   // when acquiring the exclusive lock in case the journal is corrupt
   bool disabling_journal = false;
   if (!enabled && ((features & RBD_FEATURE_JOURNALING) != 0)) {
-    RWLock::WLocker snap_locker(m_image_ctx.snap_lock);
+    RWLock::WLocker image_locker(m_image_ctx.image_lock);
     m_image_ctx.set_journal_policy(new journal::DisabledPolicy());
     disabling_journal = true;
   }
   BOOST_SCOPE_EXIT_ALL( (this)(disabling_journal) ) {
     if (disabling_journal) {
-      RWLock::WLocker snap_locker(m_image_ctx.snap_lock);
+      RWLock::WLocker image_locker(m_image_ctx.image_lock);
       m_image_ctx.set_journal_policy(
         new journal::StandardPolicy<I>(&m_image_ctx));
     }
   };
 
-  r = invoke_async_request("update_features", false,
-                           boost::bind(&Operations<I>::execute_update_features,
-                                       this, features, enabled, _1, 0),
-                           boost::bind(&ImageWatcher<I>::notify_update_features,
-                                       m_image_ctx.image_watcher, features,
-                                       enabled, _1));
+  // The journal options are not passed to the lock owner in the
+  // update features request. Therefore, if journaling is being
+  // enabled, the lock should be locally acquired instead of
+  // attempting to send the request to the peer.
+  if (enabled && (features & RBD_FEATURE_JOURNALING) != 0) {
+    C_SaferCond cond_ctx;
+    {
+      RWLock::RLocker owner_lock(m_image_ctx.owner_lock);
+      r = prepare_image_update(true);
+      if (r < 0) {
+        return r;
+      }
+
+      execute_update_features(features, enabled, &cond_ctx, 0);
+    }
+
+    r = cond_ctx.wait();
+  } else {
+    r = invoke_async_request("update_features", false,
+                             boost::bind(&Operations<I>::execute_update_features,
+                                         this, features, enabled, _1, 0),
+                             boost::bind(&ImageWatcher<I>::notify_update_features,
+                                         m_image_ctx.image_watcher, features,
+                                         enabled, _1));
+  }
   ldout(cct, 2) << "update_features finished" << dendl;
   return r;
 }
@@ -1326,13 +1396,18 @@ template <typename I>
 void Operations<I>::execute_update_features(uint64_t features, bool enabled,
                                             Context *on_finish,
                                             uint64_t journal_op_tid) {
-  assert(m_image_ctx.owner_lock.is_locked());
-  assert(m_image_ctx.exclusive_lock == nullptr ||
-         m_image_ctx.exclusive_lock->is_lock_owner());
+  ceph_assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(m_image_ctx.exclusive_lock == nullptr ||
+              m_image_ctx.exclusive_lock->is_lock_owner());
 
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": features=" << features
                 << ", enabled=" << enabled << dendl;
+
+  if (m_image_ctx.operations_disabled) {
+    on_finish->complete(-EROFS);
+    return;
+  }
 
   if (enabled) {
     operation::EnableFeaturesRequest<I> *req =
@@ -1358,7 +1433,12 @@ int Operations<I>::metadata_set(const std::string &key,
   bool config_override = util::is_metadata_config_override(key, &config_key);
   if (config_override) {
     // validate config setting
-    int r = md_config_t().set_val(config_key.c_str(), value);
+    if (!librbd::api::Config<I>::is_option_name(&m_image_ctx, config_key)) {
+      lderr(cct) << "validation for " << key
+                 << " failed: not allowed image level override" << dendl;
+      return -EINVAL;
+    }
+    int r = ConfigProxy{false}.set_val(config_key.c_str(), value);
     if (r < 0) {
       return r;
     }
@@ -1397,11 +1477,16 @@ template <typename I>
 void Operations<I>::execute_metadata_set(const std::string &key,
 					const std::string &value,
 					Context *on_finish) {
-  assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(m_image_ctx.owner_lock.is_locked());
 
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": key=" << key << ", value="
                 << value << dendl;
+
+  if (m_image_ctx.operations_disabled) {
+    on_finish->complete(-EROFS);
+    return;
+  }
 
   operation::MetadataSetRequest<I> *request =
     new operation::MetadataSetRequest<I>(m_image_ctx,
@@ -1414,10 +1499,6 @@ template <typename I>
 int Operations<I>::metadata_remove(const std::string &key) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": key=" << key << dendl;
-
-  if (m_image_ctx.read_only) {
-    return -EROFS;
-  }
 
   int r = m_image_ctx.state->refresh_if_required();
   if (r < 0) {
@@ -1458,10 +1539,15 @@ int Operations<I>::metadata_remove(const std::string &key) {
 template <typename I>
 void Operations<I>::execute_metadata_remove(const std::string &key,
                                            Context *on_finish) {
-  assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(m_image_ctx.owner_lock.is_locked());
 
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": key=" << key << dendl;
+
+  if (m_image_ctx.operations_disabled) {
+    on_finish->complete(-EROFS);
+    return;
+  }
 
   operation::MetadataRemoveRequest<I> *request =
     new operation::MetadataRemoveRequest<I>(
@@ -1471,9 +1557,133 @@ void Operations<I>::execute_metadata_remove(const std::string &key,
 }
 
 template <typename I>
+int Operations<I>::migrate(ProgressContext &prog_ctx) {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 20) << "migrate" << dendl;
+
+  int r = m_image_ctx.state->refresh_if_required();
+  if (r < 0) {
+    return r;
+  }
+
+  if (m_image_ctx.read_only) {
+    return -EROFS;
+  }
+
+  {
+    RWLock::RLocker image_locker(m_image_ctx.image_lock);
+    if (m_image_ctx.migration_info.empty()) {
+      lderr(cct) << "image has no migrating parent" << dendl;
+      return -EINVAL;
+    }
+  }
+
+  uint64_t request_id = ++m_async_request_seq;
+  r = invoke_async_request("migrate", false,
+                           boost::bind(&Operations<I>::execute_migrate, this,
+                                       boost::ref(prog_ctx), _1),
+                           boost::bind(&ImageWatcher<I>::notify_migrate,
+                                       m_image_ctx.image_watcher, request_id,
+                                       boost::ref(prog_ctx), _1));
+
+  if (r < 0 && r != -EINVAL) {
+    return r;
+  }
+  ldout(cct, 20) << "migrate finished" << dendl;
+  return 0;
+}
+
+template <typename I>
+void Operations<I>::execute_migrate(ProgressContext &prog_ctx,
+                                    Context *on_finish) {
+  ceph_assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(m_image_ctx.exclusive_lock == nullptr ||
+              m_image_ctx.exclusive_lock->is_lock_owner());
+
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 20) << "migrate" << dendl;
+
+  if (m_image_ctx.read_only || m_image_ctx.operations_disabled) {
+    on_finish->complete(-EROFS);
+    return;
+  }
+
+  m_image_ctx.image_lock.get_read();
+
+  if (m_image_ctx.migration_info.empty()) {
+    lderr(cct) << "image has no migrating parent" << dendl;
+    m_image_ctx.image_lock.put_read();
+    on_finish->complete(-EINVAL);
+    return;
+  }
+  if (m_image_ctx.snap_id != CEPH_NOSNAP) {
+    lderr(cct) << "snapshots cannot be migrated" << dendl;
+    m_image_ctx.image_lock.put_read();
+    on_finish->complete(-EROFS);
+    return;
+  }
+
+  m_image_ctx.image_lock.put_read();
+
+  operation::MigrateRequest<I> *req = new operation::MigrateRequest<I>(
+    m_image_ctx, new C_NotifyUpdate<I>(m_image_ctx, on_finish), prog_ctx);
+  req->send();
+}
+
+template <typename I>
+int Operations<I>::sparsify(size_t sparse_size, ProgressContext &prog_ctx) {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 20) << "sparsify" << dendl;
+  
+  if (sparse_size < 4096 || sparse_size > m_image_ctx.get_object_size() ||
+      (sparse_size & (sparse_size - 1)) != 0) {
+    lderr(cct) << "sparse size should be power of two not less than 4096"
+               << " and not larger image object size" << dendl;
+    return -EINVAL;
+  }
+
+  uint64_t request_id = ++m_async_request_seq;
+  int r = invoke_async_request("sparsify", false,
+                               boost::bind(&Operations<I>::execute_sparsify,
+                                           this, sparse_size,
+                                           boost::ref(prog_ctx), _1),
+                               boost::bind(&ImageWatcher<I>::notify_sparsify,
+                                           m_image_ctx.image_watcher,
+                                           request_id, sparse_size,
+                                           boost::ref(prog_ctx), _1));
+  if (r < 0 && r != -EINVAL) {
+    return r;
+  }
+  ldout(cct, 20) << "resparsify finished" << dendl;
+  return 0;
+}
+
+template <typename I>
+void Operations<I>::execute_sparsify(size_t sparse_size,
+                                     ProgressContext &prog_ctx,
+                                     Context *on_finish) {
+  ceph_assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(m_image_ctx.exclusive_lock == nullptr ||
+              m_image_ctx.exclusive_lock->is_lock_owner());
+
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 20) << "sparsify" << dendl;
+
+  if (m_image_ctx.operations_disabled) {
+    on_finish->complete(-EROFS);
+    return;
+  }
+
+  auto req = new operation::SparsifyRequest<I>(
+    m_image_ctx, sparse_size, new C_NotifyUpdate<I>(m_image_ctx, on_finish),
+    prog_ctx);
+  req->send();
+}
+
+template <typename I>
 int Operations<I>::prepare_image_update(bool request_lock) {
-  assert(m_image_ctx.owner_lock.is_locked() &&
-         !m_image_ctx.owner_lock.is_wlocked());
+  ceph_assert(m_image_ctx.owner_lock.is_locked() &&
+              !m_image_ctx.owner_lock.is_wlocked());
   if (m_image_ctx.image_watcher == nullptr) {
     return -EROFS;
   }
@@ -1509,11 +1719,14 @@ int Operations<I>::prepare_image_update(bool request_lock) {
     m_image_ctx.exclusive_lock->unblock_requests();
   }
 
+  if (r == -EAGAIN || r == -EBUSY) {
+    r = 0;
+  }
   if (r < 0) {
     return r;
   } else if (m_image_ctx.exclusive_lock != nullptr &&
              !m_image_ctx.exclusive_lock->is_lock_owner()) {
-    return -EROFS;
+    return m_image_ctx.exclusive_lock->get_unlocked_op_error();
   }
 
   return 0;

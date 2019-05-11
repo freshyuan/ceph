@@ -5,7 +5,7 @@ Erasure code profiles
 =====================
 
 Erasure code is defined by a **profile** and is used when creating an
-erasure coded pool and the associated crush ruleset.
+erasure coded pool and the associated CRUSH rule.
 
 The **default** erasure code profile (which is created when the Ceph
 cluster is initialized) provides the same level of redundancy as two
@@ -32,6 +32,7 @@ same time.
 	erasure-code-isa
 	erasure-code-lrc
 	erasure-code-shec
+	erasure-code-clay
 
 osd erasure-code-profile set
 ============================

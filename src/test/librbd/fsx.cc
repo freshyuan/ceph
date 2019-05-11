@@ -17,9 +17,12 @@
 
 #include <sys/types.h>
 #include <unistd.h>
+#include <getopt.h>
 #include <limits.h>
-#include <time.h>
 #include <strings.h>
+#if defined(__FreeBSD__)
+#include <sys/disk.h>
+#endif
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -31,7 +34,6 @@
 #include <err.h>
 #endif
 #include <signal.h>
-#include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -145,6 +147,9 @@ off_t		file_size = 0;
 off_t		biggest = 0;
 unsigned long	testcalls = 0;		/* calls to function "test" */
 
+const char* cluster_name = "ceph";      /* --cluster optional */
+const char* client_id = "admin";        /* --id optional */
+
 unsigned long	simulatedopcount = 0;	/* -b flag */
 int	closeprob = 0;			/* -c flag */
 int	debug = 0;			/* -d flag */
@@ -254,6 +259,7 @@ get_random(void)
 	return random_generator();
 }
 
+int get_features(uint64_t* features);
 void replay_imagename(char *buf, size_t len, int clones);
 
 namespace {
@@ -358,15 +364,19 @@ int create_replay_image(rados_ioctx_t ioctx, int order,
         librados::IoCtx io_ctx;
         librados::IoCtx::from_rados_ioctx_t(ioctx, io_ctx);
 
-        int r;
+        uint64_t features;
+        int r = get_features(&features);
+        if (r < 0) {
+                return r;
+        }
+
         librbd::RBD rbd;
         if (last_replay_image_name == nullptr) {
-                r = rbd.create2(io_ctx, replay_image_name, 0,
-                                RBD_FEATURES_ALL, &order);
+                r = rbd.create2(io_ctx, replay_image_name, 0, features, &order);
         } else {
                 r = rbd.clone2(io_ctx, last_replay_image_name, "snap",
-                               io_ctx, replay_image_name, RBD_FEATURES_ALL,
-                               &order, stripe_unit, stripe_count);
+                               io_ctx, replay_image_name, features, &order,
+                               stripe_unit, stripe_count);
         }
 
         if (r < 0) {
@@ -421,7 +431,7 @@ int replay_journal(rados_ioctx_t ioctx, const char *image_name,
                 return r;
         }
 
-        replay_journaler.start_append(0, 0, 0);
+        replay_journaler.start_append(0, 0, 0, 0);
 
         C_SaferCond replay_ctx;
         ReplayHandler replay_handler(&journaler, &replay_journaler,
@@ -532,6 +542,27 @@ struct krbd_ctx *krbd;		/* handle for libkrbd */
 #endif
 bool skip_partial_discard;	/* rbd_skip_partial_discard config value*/
 
+int get_features(uint64_t* features) {
+        char buf[1024];
+        int r = rados_conf_get(cluster, "rbd_default_features", buf,
+                               sizeof(buf));
+        if (r < 0) {
+                simple_err("Could not get rbd_default_features value", r);
+                return r;
+        }
+
+        *features = strtol(buf, NULL, 0);
+
+        if (clone_calls) {
+                *features |= RBD_FEATURE_LAYERING;
+        }
+        if (journal_replay) {
+                *features |= (RBD_FEATURE_EXCLUSIVE_LOCK |
+                              RBD_FEATURE_JOURNALING);
+        }
+        return 0;
+}
+
 /*
  * librbd/krbd rbd_operations handlers.  Given the rest of fsx.c, no
  * attempt to do error handling is made in these handlers.
@@ -543,7 +574,7 @@ __librbd_open(const char *name, struct rbd_ctx *ctx)
 	rbd_image_t image;
 	int ret;
 
-	assert(!ctx->name && !ctx->image &&
+	ceph_assert(!ctx->name && !ctx->image &&
 	       !ctx->krbd_name && ctx->krbd_fd < 0);
 
 	ret = rbd_open(ioctx, name, &image, NULL);
@@ -571,7 +602,7 @@ __librbd_close(struct rbd_ctx *ctx)
 {
 	int ret;
 
-	assert(ctx->name && ctx->image);
+	ceph_assert(ctx->name && ctx->image);
 
 	ret = rbd_close(ctx->image);
 	if (ret < 0) {
@@ -718,16 +749,13 @@ librbd_compare_and_write(struct rbd_ctx *ctx, uint64_t off, size_t len,
 int
 librbd_get_size(struct rbd_ctx *ctx, uint64_t *size)
 {
-	rbd_image_info_t info;
 	int ret;
 
-	ret = rbd_stat(ctx->image, &info, sizeof(info));
+	ret = rbd_get_size(ctx->image, size);
 	if (ret < 0) {
-		prt("rbd_stat failed\n");
+		prt("rbd_get_size failed\n");
 		return ret;
 	}
-
-	*size = info.size;
 
 	return 0;
 }
@@ -765,16 +793,16 @@ __librbd_deep_copy(struct rbd_ctx *ctx, const char *src_snapname,
         };
 	ret = rbd_image_options_set_uint64(opts, RBD_IMAGE_OPTION_FEATURES,
                                            features);
-	assert(ret == 0);
+	ceph_assert(ret == 0);
 	ret = rbd_image_options_set_uint64(opts, RBD_IMAGE_OPTION_ORDER,
                                            *order);
-	assert(ret == 0);
+	ceph_assert(ret == 0);
 	ret = rbd_image_options_set_uint64(opts, RBD_IMAGE_OPTION_STRIPE_UNIT,
                                            stripe_unit);
-	assert(ret == 0);
+	ceph_assert(ret == 0);
 	ret = rbd_image_options_set_uint64(opts, RBD_IMAGE_OPTION_STRIPE_COUNT,
                                            stripe_count);
-	assert(ret == 0);
+	ceph_assert(ret == 0);
 
 	ret = rbd_snap_set(ctx->image, src_snapname);
 	if (ret < 0) {
@@ -846,7 +874,12 @@ __librbd_clone(struct rbd_ctx *ctx, const char *src_snapname,
 		return ret;
 	}
 
-	uint64_t features = RBD_FEATURES_ALL;
+        uint64_t features;
+        ret = get_features(&features);
+        if (ret < 0) {
+                return ret;
+        }
+
 	if (krbd) {
 		features &= ~(RBD_FEATURE_OBJECT_MAP     |
                               RBD_FEATURE_FAST_DIFF      |
@@ -931,7 +964,7 @@ krbd_open(const char *name, struct rbd_ctx *ctx)
 	if (ret < 0)
 		return ret;
 
-	ret = krbd_map(krbd, pool, name, "", "", &devnode);
+	ret = krbd_map(krbd, pool, "", name, "", "", &devnode);
 	if (ret < 0) {
 		prt("krbd_map(%s) failed\n", name);
 		return ret;
@@ -955,7 +988,7 @@ krbd_close(struct rbd_ctx *ctx)
 {
 	int ret;
 
-	assert(ctx->krbd_name && ctx->krbd_fd >= 0);
+	ceph_assert(ctx->krbd_name && ctx->krbd_fd >= 0);
 
 	if (close(ctx->krbd_fd) < 0) {
 		ret = -errno;
@@ -1057,7 +1090,7 @@ krbd_discard(struct rbd_ctx *ctx, uint64_t off, uint64_t len)
 	int ret;
 
 	/*
-	 * BLKDISCARD goes straight to disk and doesn't do anything
+	 * BLKZEROOUT goes straight to disk and doesn't do anything
 	 * about dirty buffers.  This means we need to flush so that
 	 *
 	 *   write 0..3M
@@ -1071,19 +1104,22 @@ krbd_discard(struct rbd_ctx *ctx, uint64_t off, uint64_t len)
 	 *
 	 * returns "data 0000 data" rather than "data data data" in
 	 * case 1..2M was cached.
+	 *
+         * Note: These cache coherency issues are supposed to be fixed
+         * in recent kernels.
 	 */
 	ret = __krbd_flush(ctx, true);
 	if (ret < 0)
 		return ret;
 
 	/*
-	 * off and len must be 512-byte aligned, otherwise BLKDISCARD
+	 * off and len must be 512-byte aligned, otherwise BLKZEROOUT
 	 * will fail with -EINVAL.  This means that -K (enable krbd
 	 * mode) requires -h 512 or similar.
 	 */
-	if (ioctl(ctx->krbd_fd, BLKDISCARD, &range) < 0) {
+	if (ioctl(ctx->krbd_fd, BLKZEROOUT, &range) < 0) {
 		ret = -errno;
-		prt("BLKDISCARD(%llu, %llu) failed\n", off, len);
+		prt("BLKZEROOUT(%llu, %llu) failed\n", off, len);
 		return ret;
 	}
 
@@ -1111,7 +1147,7 @@ krbd_resize(struct rbd_ctx *ctx, uint64_t size)
 {
 	int ret;
 
-	assert(size % truncbdy == 0);
+	ceph_assert(size % truncbdy == 0);
 
 	/*
 	 * When krbd detects a size change, it calls revalidate_disk(),
@@ -1242,7 +1278,7 @@ nbd_close(struct rbd_ctx *ctx)
 {
 	int r;
 
-	assert(ctx->krbd_name && ctx->krbd_fd >= 0);
+	ceph_assert(ctx->krbd_name && ctx->krbd_fd >= 0);
 
 	if (close(ctx->krbd_fd) < 0) {
 		r = -errno;
@@ -1303,18 +1339,283 @@ const struct rbd_operations nbd_operations = {
 };
 #endif // __linux__
 
+#if defined(__FreeBSD__)
+int
+ggate_open(const char *name, struct rbd_ctx *ctx)
+{
+	int r;
+	int fd;
+	char dev[4096];
+	char *devnode;
+
+	SubProcess process("rbd-ggate", SubProcess::KEEP, SubProcess::PIPE,
+			   SubProcess::KEEP);
+	process.add_cmd_arg("map");
+	std::string img;
+	img.append(pool);
+	img.append("/");
+	img.append(name);
+	process.add_cmd_arg(img.c_str());
+
+	r = __librbd_open(name, ctx);
+	if (r < 0) {
+		return r;
+	}
+
+	r = process.spawn();
+	if (r < 0) {
+		prt("ggate_open failed to run rbd-ggate: %s\n",
+		    process.err().c_str());
+		return r;
+	}
+	r = safe_read(process.get_stdout(), dev, sizeof(dev));
+	if (r < 0) {
+		prt("ggate_open failed to get ggate device path\n");
+		return r;
+	}
+	for (int i = 0; i < r; ++i) {
+		if (dev[i] == '\r' || dev[i] == '\n') {
+			dev[i] = 0;
+		}
+	}
+	dev[r] = 0;
+	r = process.join();
+	if (r) {
+		prt("rbd-ggate failed with error: %s", process.err().c_str());
+		return -EINVAL;
+	}
+
+	devnode = strdup(dev);
+	if (!devnode) {
+		return -ENOMEM;
+	}
+
+	for (int i = 0; i < 100; i++) {
+		fd = open(devnode, O_RDWR | o_direct);
+		if (fd >= 0 || errno != ENOENT) {
+			break;
+		}
+		usleep(100000);
+	}
+	if (fd < 0) {
+		r = -errno;
+		prt("open(%s) failed\n", devnode);
+		return r;
+	}
+
+	ctx->krbd_name = devnode;
+	ctx->krbd_fd = fd;
+
+	return 0;
+}
+
+int
+ggate_close(struct rbd_ctx *ctx)
+{
+	int r;
+
+	ceph_assert(ctx->krbd_name && ctx->krbd_fd >= 0);
+
+	if (close(ctx->krbd_fd) < 0) {
+		r = -errno;
+		prt("close(%s) failed\n", ctx->krbd_name);
+		return r;
+	}
+
+	SubProcess process("rbd-ggate");
+	process.add_cmd_arg("unmap");
+	process.add_cmd_arg(ctx->krbd_name);
+
+        r = process.spawn();
+        if (r < 0) {
+		prt("ggate_close failed to run rbd-nbd: %s\n",
+		    process.err().c_str());
+		return r;
+        }
+	r = process.join();
+	if (r) {
+		prt("rbd-ggate failed with error: %d", process.err().c_str());
+		return -EINVAL;
+	}
+
+	free((void *)ctx->krbd_name);
+
+	ctx->krbd_name = NULL;
+	ctx->krbd_fd = -1;
+
+	return __librbd_close(ctx);
+}
+
+ssize_t
+ggate_read(struct rbd_ctx *ctx, uint64_t off, size_t len, char *buf)
+{
+	ssize_t n;
+
+	n = pread(ctx->krbd_fd, buf, len, off);
+	if (n < 0) {
+		n = -errno;
+		prt("pread(%llu, %zu) failed\n", off, len);
+		return n;
+	}
+
+	return n;
+}
+
+ssize_t
+ggate_write(struct rbd_ctx *ctx, uint64_t off, size_t len, const char *buf)
+{
+	ssize_t n;
+
+	n = pwrite(ctx->krbd_fd, buf, len, off);
+	if (n < 0) {
+		n = -errno;
+		prt("pwrite(%llu, %zu) failed\n", off, len);
+		return n;
+	}
+
+	return n;
+}
+
+int
+__ggate_flush(struct rbd_ctx *ctx, bool invalidate)
+{
+	int ret;
+
+	if (o_direct) {
+		return 0;
+	}
+
+	if (invalidate) {
+		ret = ioctl(ctx->krbd_fd, DIOCGFLUSH, NULL);
+	} else {
+		ret = fsync(ctx->krbd_fd);
+	}
+	if (ret < 0) {
+		ret = -errno;
+		prt("%s failed\n", invalidate ? "DIOCGFLUSH" : "fsync");
+		return ret;
+	}
+
+	return 0;
+}
+
+int
+ggate_flush(struct rbd_ctx *ctx)
+{
+	return __ggate_flush(ctx, false);
+}
+
+int
+ggate_discard(struct rbd_ctx *ctx, uint64_t off, uint64_t len)
+{
+	off_t range[2] = {static_cast<off_t>(off), static_cast<off_t>(len)};
+	int ret;
+
+	ret = __ggate_flush(ctx, true);
+	if (ret < 0) {
+		return ret;
+	}
+
+	if (ioctl(ctx->krbd_fd, DIOCGDELETE, &range) < 0) {
+		ret = -errno;
+		prt("DIOCGDELETE(%llu, %llu) failed\n", off, len);
+		return ret;
+	}
+
+	return 0;
+}
+
+int
+ggate_get_size(struct rbd_ctx *ctx, uint64_t *size)
+{
+	off_t bytes;
+
+	if (ioctl(ctx->krbd_fd, DIOCGMEDIASIZE, &bytes) < 0) {
+		int ret = -errno;
+		prt("DIOCGMEDIASIZE failed\n");
+		return ret;
+	}
+
+	*size = bytes;
+
+	return 0;
+}
+
+int
+ggate_resize(struct rbd_ctx *ctx, uint64_t size)
+{
+	int ret;
+
+	ceph_assert(size % truncbdy == 0);
+
+	ret = __ggate_flush(ctx, false);
+	if (ret < 0) {
+		return ret;
+	}
+
+	return __librbd_resize(ctx, size);
+}
+
+int
+ggate_clone(struct rbd_ctx *ctx, const char *src_snapname,
+	    const char *dst_imagename, int *order, int stripe_unit,
+	    int stripe_count)
+{
+	int ret;
+
+	ret = __ggate_flush(ctx, false);
+	if (ret < 0) {
+		return ret;
+	}
+
+	return __librbd_clone(ctx, src_snapname, dst_imagename, order,
+			      stripe_unit, stripe_count, false);
+}
+
+int
+ggate_flatten(struct rbd_ctx *ctx)
+{
+	int ret;
+
+	ret = __ggate_flush(ctx, false);
+	if (ret < 0) {
+		return ret;
+	}
+
+	return __librbd_flatten(ctx);
+}
+
+const struct rbd_operations ggate_operations = {
+	ggate_open,
+	ggate_close,
+	ggate_read,
+	ggate_write,
+	ggate_flush,
+	ggate_discard,
+	ggate_get_size,
+	ggate_resize,
+	ggate_clone,
+	ggate_flatten,
+	NULL,
+};
+#endif // __FreeBSD__
+
 struct rbd_ctx ctx = RBD_CTX_INIT;
 const struct rbd_operations *ops = &librbd_operations;
 
 static bool rbd_image_has_parent(struct rbd_ctx *ctx)
 {
 	int ret;
+	rbd_linked_image_spec_t parent_image;
+	rbd_snap_spec_t parent_snap;
 
-	ret = rbd_get_parent_info(ctx->image, NULL, 0, NULL, 0, NULL, 0);
-	if (ret < 0 && ret != -ENOENT) {
+	ret = rbd_get_parent(ctx->image, &parent_image, &parent_snap);
+        if (ret < 0 && ret != -ENOENT) {
 		prterrcode("rbd_get_parent_info", ret);
 		exit(1);
 	}
+	rbd_linked_image_spec_cleanup(&parent_image);
+	rbd_snap_spec_cleanup(&parent_snap);
 
 	return !ret;
 }
@@ -1630,8 +1931,11 @@ create_image()
 	int r;
 	int order = 0;
 	char buf[32];
+	char client_name[256];
 
-	r = rados_create(&cluster, NULL);
+	sprintf(client_name, "client.%s", client_id);
+
+	r = rados_create2(&cluster, cluster_name, client_name, 0);
 	if (r < 0) {
 		simple_err("Could not create cluster handle", r);
 		return r;
@@ -1668,17 +1972,15 @@ create_image()
         rados_application_enable(ioctx, "rbd", 1);
 
 	if (clone_calls || journal_replay) {
-                uint64_t features = 0;
-                if (clone_calls) {
-                        features |= RBD_FEATURE_LAYERING;
+                uint64_t features;
+                r = get_features(&features);
+                if (r < 0) {
+                        goto failed_open;
                 }
-                if (journal_replay) {
-                        features |= (RBD_FEATURE_EXCLUSIVE_LOCK |
-                                     RBD_FEATURE_JOURNALING);
-                }
-		r = rbd_create2(ioctx, iname, 0, features, &order);
+
+		r = rbd_create2(ioctx, iname, file_size, features, &order);
 	} else {
-		r = rbd_create(ioctx, iname, 0, &order);
+		r = rbd_create(ioctx, iname, file_size, &order);
 	}
 	if (r < 0) {
 		simple_err("Error creating image", r);
@@ -2128,8 +2430,15 @@ docompareandwrite(unsigned offset, unsigned size)
 
 void clone_filename(char *buf, size_t len, int clones)
 {
+#if __GNUC__ && __GNUC__ >= 8
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
 	snprintf(buf, len, "%s/fsx-%s-parent%d",
 		 dirpath, iname, clones);
+#if __GNUC__ && __GNUC__ >= 8
+#pragma GCC diagnostic pop
+#endif
 }
 
 void clone_imagename(char *buf, size_t len, int clones)
@@ -2175,7 +2484,7 @@ do_clone()
 	clone_imagename(imagename, sizeof(imagename), num_clones);
 	clone_imagename(lastimagename, sizeof(lastimagename),
 			num_clones - 1);
-	assert(strcmp(lastimagename, ctx.name) == 0);
+	ceph_assert(strcmp(lastimagename, ctx.name) == 0);
 
 	ret = ops->clone(&ctx, "snap", imagename, &order, stripe_unit,
 			 stripe_count);
@@ -2203,7 +2512,7 @@ do_clone()
 				newsize = 0;
 			}
 
-			assert(newsize != (uint64_t)file_size);
+			ceph_assert(newsize != (uint64_t)file_size);
 			prt("truncating image %s from 0x%llx (overlap 0x%llx) to 0x%llx\n",
 			    ctx.name, file_size, overlap, newsize);
 
@@ -2309,7 +2618,7 @@ check_clone(int clonenum, bool replay_image)
 
 	good_buf = NULL;
 	ret = posix_memalign((void **)&good_buf,
-			     MAX(writebdy, (int)sizeof(void *)),
+			     std::max(writebdy, (int)sizeof(void *)),
 			     file_info.st_size);
 	if (ret > 0) {
 		prterrcode("check_clone: posix_memalign(good_buf)", -ret);
@@ -2318,7 +2627,7 @@ check_clone(int clonenum, bool replay_image)
 
 	temp_buf = NULL;
 	ret = posix_memalign((void **)&temp_buf,
-			     MAX(readbdy, (int)sizeof(void *)),
+			     std::max(readbdy, (int)sizeof(void *)),
 			     file_info.st_size);
 	if (ret > 0) {
 		prterrcode("check_clone: posix_memalign(temp_buf)", -ret);
@@ -2617,6 +2926,9 @@ usage(void)
 #ifdef FALLOCATE
 "	-F: Do not use fallocate (preallocation) calls\n"
 #endif
+#if defined(__FreeBSD__)
+"	-G: enable rbd-ggate mode (use -L, -r and -w too)\n"
+#endif
 "	-H: do not use punch hole calls\n"
 #if defined(WITH_KRBD)
 "	-K: enable krbd mode (use -t and -h too)\n"
@@ -2737,10 +3049,20 @@ void remove_image(rados_ioctx_t ioctx, char *imagename, bool remove_snap,
 int
 main(int argc, char **argv)
 {
+	enum {
+		LONG_OPT_CLUSTER = 1000,
+		LONG_OPT_ID = 1001
+	};
+
 	int	i, style, ch, ret;
 	char	*endp;
 	char goodfile[1024];
 	char logfile[1024];
+
+	const char* optstring = "b:c:dfgh:jkl:m:no:p:qr:s:t:w:xyCD:FGHKMLN:OP:RS:UWZ";
+	const struct option longopts[] = {
+		{"cluster", 1, NULL, LONG_OPT_CLUSTER},
+		{"id", 1, NULL, LONG_OPT_ID}};
 
 	goodfile[0] = 0;
 	logfile[0] = 0;
@@ -2751,9 +3073,14 @@ main(int argc, char **argv)
 
 	setvbuf(stdout, (char *)0, _IOLBF, 0); /* line buffered stdout */
 
-	while ((ch = getopt(argc, argv, "b:c:dfgh:jkl:m:no:p:qr:s:t:w:xyCD:FHKMLN:OP:RS:UWZ"))
-	       != EOF)
+	while ((ch = getopt_long(argc, argv, optstring, longopts, NULL)) != EOF) {
 		switch (ch) {
+		case LONG_OPT_CLUSTER:
+			cluster_name = optarg;
+			break;
+		case LONG_OPT_ID:
+			client_id = optarg;
+			break;
 		case 'b':
 			simulatedopcount = getnum(optarg, &endp);
 			if (!quiet)
@@ -2866,6 +3193,12 @@ main(int argc, char **argv)
 		case 'F':
 			fallocate_calls = 0;
 			break;
+#if defined(__FreeBSD__)
+		case 'G':
+			prt("rbd-ggate mode enabled\n");
+			ops = &ggate_operations;
+			break;
+#endif
 		case 'H':
 			punch_hole_calls = 0;
 			break;
@@ -2882,8 +3215,7 @@ main(int argc, char **argv)
 			break;
 #endif
 		case 'L':
-			prt("lite mode not supported for rbd\n");
-			exit(1);
+			lite = 1;
 			break;
 		case 'N':
 			numops = getnum(optarg, &endp);
@@ -2921,7 +3253,7 @@ main(int argc, char **argv)
 		case 'S':
                         seed = getnum(optarg, &endp);
 			if (seed == 0)
-				seed = time(0) % 10000;
+				seed = std::random_device()() % 10000;
 			if (!quiet)
 				fprintf(stdout, "Seed set to %d\n", seed);
 			if (seed < 0)
@@ -2942,6 +3274,7 @@ main(int argc, char **argv)
 			usage();
 			/* NOTREACHED */
 		}
+	}
 	argc -= optind;
 	argv += optind;
 	if (argc != 2)
@@ -2961,6 +3294,10 @@ main(int argc, char **argv)
 	signal(SIGUSR2,	cleanup);
 
 	random_generator.seed(seed);
+
+	if (lite) {
+		file_size = maxfilelen;
+	}
 
 	ret = create_image();
 	if (ret < 0) {
@@ -2994,7 +3331,7 @@ main(int argc, char **argv)
 		original_buf[i] = get_random() % 256;
 
 	ret = posix_memalign((void **)&good_buf,
-			     MAX(writebdy, (int)sizeof(void *)), maxfilelen);
+			     std::max(writebdy, (int)sizeof(void *)), maxfilelen);
 	if (ret > 0) {
 		if (ret == EINVAL)
 			prt("writebdy is not a suitable power of two\n");
@@ -3005,7 +3342,7 @@ main(int argc, char **argv)
 	memset(good_buf, '\0', maxfilelen);
 
 	ret = posix_memalign((void **)&temp_buf,
-			     MAX(readbdy, (int)sizeof(void *)), maxfilelen);
+			     std::max(readbdy, (int)sizeof(void *)), maxfilelen);
 	if (ret > 0) {
 		if (ret == EINVAL)
 			prt("readbdy is not a suitable power of two\n");

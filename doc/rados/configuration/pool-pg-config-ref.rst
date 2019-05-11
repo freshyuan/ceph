@@ -6,7 +6,7 @@
 
 When you create pools and set the number of placement groups for the pool, Ceph
 uses default values when you don't specifically override the defaults. **We
-recommend** overridding some of the defaults. Specifically, we recommend setting
+recommend** overriding some of the defaults. Specifically, we recommend setting
 a pool's replica size and overriding the default number of placement groups. You
 can specifically set these values when running `pool`_ commands. You can also
 override the defaults by adding new ones in the ``[global]`` section of  your
@@ -96,8 +96,8 @@ Ceph configuration file.
 
 :Description: Issue a ``HEALTH_WARN`` in cluster log if the average object number
               of a certain pool is greater than ``mon pg warn max object skew`` times
-              the average object number of the whole pool. (a non-positive number
-              disables this)
+              the average object number of the whole pool. (zero or a non-positive
+              number disables this). Note that this option applies to the managers.
 :Type: Float
 :Default: ``10``
 
@@ -156,13 +156,12 @@ Ceph configuration file.
           See `Weighting Bucket Items`_ for details.
 
 
-``osd pool default crush replicated ruleset``
+``osd pool default crush rule``
 
-:Description: The default CRUSH ruleset to use when creating a replicated pool.
+:Description: The default CRUSH rule to use when creating a replicated pool.
 :Type: 8-bit Integer
-:Default: ``CEPH_DEFAULT_CRUSH_REPLICATED_RULESET``, which means "pick
-          a ruleset with the lowest numerical ID and use that".  This is to
-          make pool creation work in the absence of ruleset 0.
+:Default: ``-1``, which means "pick the rule with the lowest numerical ID and 
+          use that".  This is to make pool creation work in the absence of rule 0.
 
 
 ``osd pool erasure code stripe unit``
@@ -264,6 +263,20 @@ Ceph configuration file.
 
 :Type: Float
 :Default: ``2``
+
+``osd recovery priority``
+
+:Description: Priority of recovery in the work queue.
+
+:Type: Integer
+:Default: ``5``
+
+``osd recovery op priority``
+
+:Description: Default priority used for recovery operations if pool doesn't override.
+
+:Type: Integer
+:Default: ``3``
 
 .. _pool: ../../operations/pools
 .. _Monitoring OSDs and PGs: ../../operations/monitoring-osd-pg#peering

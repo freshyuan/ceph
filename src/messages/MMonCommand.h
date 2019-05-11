@@ -18,25 +18,25 @@
 #include "messages/PaxosServiceMessage.h"
 
 #include <vector>
-using std::vector;
+#include <string>
 
 class MMonCommand : public PaxosServiceMessage {
- public:
+public:
   uuid_d fsid;
-  vector<string> cmd;
+  std::vector<std::string> cmd;
 
-  MMonCommand() : PaxosServiceMessage(MSG_MON_COMMAND, 0) {}
+  MMonCommand() : PaxosServiceMessage{MSG_MON_COMMAND, 0} {}
   MMonCommand(const uuid_d &f)
-    : PaxosServiceMessage(MSG_MON_COMMAND, 0),
+    : PaxosServiceMessage{MSG_MON_COMMAND, 0},
       fsid(f)
   { }
 
 private:
   ~MMonCommand() override {}
 
-public:  
-  const char *get_type_name() const override { return "mon_command"; }
-  void print(ostream& o) const override {
+public:
+  std::string_view get_type_name() const override { return "mon_command"; }
+  void print(std::ostream& o) const override {
     o << "mon_command(";
     for (unsigned i=0; i<cmd.size(); i++) {
       if (i) o << ' ';
@@ -44,18 +44,23 @@ public:
     }
     o << " v " << version << ")";
   }
-  
+
   void encode_payload(uint64_t features) override {
+    using ceph::encode;
     paxos_encode();
-    ::encode(fsid, payload);
-    ::encode(cmd, payload);
+    encode(fsid, payload);
+    encode(cmd, payload);
   }
   void decode_payload() override {
-    bufferlist::iterator p = payload.begin();
+    using ceph::decode;
+    auto p = payload.cbegin();
     paxos_decode(p);
-    ::decode(fsid, p);
-    ::decode(cmd, p);
+    decode(fsid, p);
+    decode(cmd, p);
   }
+private:
+  template<class T, typename... Args>
+  friend boost::intrusive_ptr<T> ceph::make_message(Args&&... args);
 };
 
 #endif

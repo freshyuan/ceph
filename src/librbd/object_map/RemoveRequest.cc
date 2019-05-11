@@ -8,7 +8,7 @@
 #include "librbd/ImageCtx.h"
 #include "librbd/ObjectMap.h"
 #include "librbd/Utils.h"
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -35,7 +35,7 @@ void RemoveRequest<I>::send_remove_object_map() {
   CephContext *cct = m_image_ctx->cct;
   ldout(cct, 20) << __func__ << dendl;
 
-  RWLock::WLocker snap_locker(m_image_ctx->snap_lock);
+  RWLock::WLocker image_locker(m_image_ctx->image_lock);
   std::vector<uint64_t> snap_ids;
   snap_ids.push_back(CEPH_NOSNAP);
   for (auto it : m_image_ctx->snap_info) {
@@ -43,7 +43,7 @@ void RemoveRequest<I>::send_remove_object_map() {
   }
 
   Mutex::Locker locker(m_lock);
-  assert(m_ref_counter == 0);
+  ceph_assert(m_ref_counter == 0);
 
   for (auto snap_id : snap_ids) {
     m_ref_counter++;
@@ -53,7 +53,7 @@ void RemoveRequest<I>::send_remove_object_map() {
       create_rados_callback<klass, &klass::handle_remove_object_map>(this);
 
     int r = m_image_ctx->md_ctx.aio_remove(oid, comp);
-    assert(r == 0);
+    ceph_assert(r == 0);
     comp->release();
   }
 }
@@ -65,7 +65,7 @@ Context *RemoveRequest<I>::handle_remove_object_map(int *result) {
 
   {
     Mutex::Locker locker(m_lock);
-    assert(m_ref_counter > 0);
+    ceph_assert(m_ref_counter > 0);
     m_ref_counter--;
 
     if (*result < 0 && *result != -ENOENT) {

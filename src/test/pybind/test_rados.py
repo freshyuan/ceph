@@ -3,12 +3,14 @@ from nose import SkipTest
 from nose.tools import eq_ as eq, ok_ as ok, assert_raises
 from rados import (Rados, Error, RadosStateError, Object, ObjectExists,
                    ObjectNotFound, ObjectBusy, requires, opt,
-                   ANONYMOUS_AUID, ADMIN_AUID, LIBRADOS_ALL_NSPACES, WriteOpCtx, ReadOpCtx,
+                   LIBRADOS_ALL_NSPACES, WriteOpCtx, ReadOpCtx,
                    LIBRADOS_SNAP_HEAD, LIBRADOS_OPERATION_BALANCE_READS, LIBRADOS_OPERATION_SKIPRWLOCKS, MonitorLog)
 import time
 import threading
 import json
 import errno
+import os
+import re
 import sys
 
 # Are we running Python 2.x
@@ -178,11 +180,6 @@ class TestRados(object):
         finally:
             self.rados.delete_pool(poolname)
 
-    def test_create_auid(self):
-        self.rados.create_pool('foo', 100)
-        assert self.rados.pool_exists('foo')
-        self.rados.delete_pool('foo')
-
     def test_eexist(self):
         self.rados.create_pool('foo')
         assert_raises(ObjectExists, self.rados.create_pool, 'foo')
@@ -225,7 +222,7 @@ class TestRados(object):
                 eq(ret, 0)
 
                 try:
-                    cmd = {"prefix":"osd tier cache-mode", "pool":"foo-cache", "tierpool":"foo-cache", "mode":"readonly", "sure":"--yes-i-really-mean-it"}
+                    cmd = {"prefix":"osd tier cache-mode", "pool":"foo-cache", "tierpool":"foo-cache", "mode":"readonly", "yes_i_really_mean_it": True}
                     ret, buf, errs = self.rados.mon_command(json.dumps(cmd), b'', timeout=30)
                     eq(ret, 0)
 
@@ -244,7 +241,7 @@ class TestRados(object):
 
     def test_get_fsid(self):
         fsid = self.rados.get_fsid()
-        eq(len(fsid), 36)
+        assert re.match('[0-9a-f\-]{36}', fsid, re.I)
 
     def test_blacklist_add(self):
         self.rados.blacklist_add("1.2.3.4/123", 1)
@@ -309,10 +306,6 @@ class TestIoctx(object):
                    'num_objects_degraded': 0,
                    'num_rd': 0})
 
-    def test_change_auid(self):
-        self.ioctx.change_auid(ANONYMOUS_AUID)
-        self.ioctx.change_auid(ADMIN_AUID)
-
     def test_write(self):
         self.ioctx.write('abc', b'abc')
         eq(self.ioctx.read('abc'), b'abc')
@@ -369,7 +362,7 @@ class TestIoctx(object):
                 ('ns1', 'ns1-c'), ('ns1', 'ns1-d')])
 
     def test_xattrs(self):
-        xattrs = dict(a=b'1', b=b'2', c=b'3', d=b'a\0b', e=b'\0')
+        xattrs = dict(a=b'1', b=b'2', c=b'3', d=b'a\0b', e=b'\0', f='')
         self.ioctx.write('abc', b'')
         for key, value in xattrs.items():
             self.ioctx.set_xattr('abc', key, value)
@@ -380,7 +373,7 @@ class TestIoctx(object):
         eq(stored_xattrs, xattrs)
 
     def test_obj_xattrs(self):
-        xattrs = dict(a=b'1', b=b'2', c=b'3', d=b'a\0b', e=b'\0')
+        xattrs = dict(a=b'1', b=b'2', c=b'3', d=b'a\0b', e=b'\0', f='')
         self.ioctx.write('abc', b'')
         obj = list(self.ioctx.list_objects())[0]
         for key, value in xattrs.items():
@@ -448,23 +441,23 @@ class TestIoctx(object):
     def test_set_omap(self):
         keys = ("1", "2", "3", "4")
         values = (b"aaa", b"bbb", b"ccc", b"\x04\x04\x04\x04")
-        with WriteOpCtx(self.ioctx) as write_op:
+        with WriteOpCtx() as write_op:
             self.ioctx.set_omap(write_op, keys, values)
             write_op.set_flags(LIBRADOS_OPERATION_SKIPRWLOCKS)
             self.ioctx.operate_write_op(write_op, "hw")
-        with ReadOpCtx(self.ioctx) as read_op:
+        with ReadOpCtx() as read_op:
             iter, ret = self.ioctx.get_omap_vals(read_op, "", "", 4)
             eq(ret, 0)
             self.ioctx.operate_read_op(read_op, "hw")
             next(iter)
             eq(list(iter), [("2", b"bbb"), ("3", b"ccc"), ("4", b"\x04\x04\x04\x04")])
-        with ReadOpCtx(self.ioctx) as read_op:
+        with ReadOpCtx() as read_op:
             iter, ret = self.ioctx.get_omap_vals(read_op, "2", "", 4)
             eq(ret, 0)
             self.ioctx.operate_read_op(read_op, "hw")
             eq(("3", b"ccc"), next(iter))
             eq(list(iter), [("4", b"\x04\x04\x04\x04")])
-        with ReadOpCtx(self.ioctx) as read_op:
+        with ReadOpCtx() as read_op:
             iter, ret = self.ioctx.get_omap_vals(read_op, "", "2", 4)
             eq(ret, 0)
             read_op.set_flags(LIBRADOS_OPERATION_BALANCE_READS)
@@ -482,7 +475,7 @@ class TestIoctx(object):
 
         keys = ("1", "2", "3", "4")
         values = (b"aaa", b"bbb", b"ccc", b"\x04\x04\x04\x04")
-        with WriteOpCtx(self.ioctx) as write_op:
+        with WriteOpCtx() as write_op:
             self.ioctx.set_omap(write_op, keys, values)
             comp = self.ioctx.operate_aio_write_op(write_op, "hw", cb, cb)
             comp.wait_for_complete()
@@ -492,7 +485,7 @@ class TestIoctx(object):
                     lock.wait()
             eq(comp.get_return_value(), 0)
 
-        with ReadOpCtx(self.ioctx) as read_op:
+        with ReadOpCtx() as read_op:
             iter, ret = self.ioctx.get_omap_vals(read_op, "", "", 4)
             eq(ret, 0)
             comp = self.ioctx.operate_aio_read_op(read_op, "hw", cb, cb)
@@ -506,7 +499,7 @@ class TestIoctx(object):
             eq(list(iter), [("2", b"bbb"), ("3", b"ccc"), ("4", b"\x04\x04\x04\x04")])
 
     def test_write_ops(self):
-        with WriteOpCtx(self.ioctx) as write_op:
+        with WriteOpCtx() as write_op:
             write_op.new(0)
             self.ioctx.operate_write_op(write_op, "write_ops")
             eq(self.ioctx.read('write_ops'), b'')
@@ -534,15 +527,15 @@ class TestIoctx(object):
     def test_get_omap_vals_by_keys(self):
         keys = ("1", "2", "3", "4")
         values = (b"aaa", b"bbb", b"ccc", b"\x04\x04\x04\x04")
-        with WriteOpCtx(self.ioctx) as write_op:
+        with WriteOpCtx() as write_op:
             self.ioctx.set_omap(write_op, keys, values)
             self.ioctx.operate_write_op(write_op, "hw")
-        with ReadOpCtx(self.ioctx) as read_op:
+        with ReadOpCtx() as read_op:
             iter, ret = self.ioctx.get_omap_vals_by_keys(read_op,("3","4",))
             eq(ret, 0)
             self.ioctx.operate_read_op(read_op, "hw")
             eq(list(iter), [("3", b"ccc"), ("4", b"\x04\x04\x04\x04")])
-        with ReadOpCtx(self.ioctx) as read_op:
+        with ReadOpCtx() as read_op:
             iter, ret = self.ioctx.get_omap_vals_by_keys(read_op,("3","4",))
             eq(ret, 0)
             with assert_raises(ObjectNotFound):
@@ -551,15 +544,15 @@ class TestIoctx(object):
     def test_get_omap_keys(self):
         keys = ("1", "2", "3")
         values = (b"aaa", b"bbb", b"ccc")
-        with WriteOpCtx(self.ioctx) as write_op:
+        with WriteOpCtx() as write_op:
             self.ioctx.set_omap(write_op, keys, values)
             self.ioctx.operate_write_op(write_op, "hw")
-        with ReadOpCtx(self.ioctx) as read_op:
+        with ReadOpCtx() as read_op:
             iter, ret = self.ioctx.get_omap_keys(read_op,"",2)
             eq(ret, 0)
             self.ioctx.operate_read_op(read_op, "hw")
             eq(list(iter), [("1", None), ("2", None)])
-        with ReadOpCtx(self.ioctx) as read_op:
+        with ReadOpCtx() as read_op:
             iter, ret = self.ioctx.get_omap_keys(read_op,"",2)
             eq(ret, 0)
             with assert_raises(ObjectNotFound):
@@ -568,13 +561,13 @@ class TestIoctx(object):
     def test_clear_omap(self):
         keys = ("1", "2", "3")
         values = (b"aaa", b"bbb", b"ccc")
-        with WriteOpCtx(self.ioctx) as write_op:
+        with WriteOpCtx() as write_op:
             self.ioctx.set_omap(write_op, keys, values)
             self.ioctx.operate_write_op(write_op, "hw")
-        with WriteOpCtx(self.ioctx) as write_op_1:
+        with WriteOpCtx() as write_op_1:
             self.ioctx.clear_omap(write_op_1)
             self.ioctx.operate_write_op(write_op_1, "hw")
-        with ReadOpCtx(self.ioctx) as read_op:
+        with ReadOpCtx() as read_op:
             iter, ret = self.ioctx.get_omap_vals_by_keys(read_op,("1",))
             eq(ret, 0)
             self.ioctx.operate_read_op(read_op, "hw")
@@ -891,6 +884,47 @@ class TestIoctx(object):
         self.ioctx.application_metadata_remove("app1", "key1")
         eq([("key2", "val2")], self.ioctx.application_metadata_list("app1"))
 
+    def test_service_daemon(self):
+        name = "pid-" + str(os.getpid())
+        metadata = {'version': '3.14', 'memory': '42'}
+        self.rados.service_daemon_register("laundry", name, metadata)
+        status = {'result': 'unknown', 'test': 'running'}
+        self.rados.service_daemon_update(status)
+
+    def test_alignment(self):
+        eq(self.ioctx.alignment(), None)
+
+
+class TestIoctxEc(object):
+
+    def setUp(self):
+        self.rados = Rados(conffile='')
+        self.rados.connect()
+        self.pool = 'test-ec'
+        self.profile = 'testprofile-%s' % self.pool
+        cmd = {"prefix": "osd erasure-code-profile set", 
+               "name": self.profile, "profile": ["k=2", "m=1", "crush-failure-domain=osd"]}
+        ret, buf, out = self.rados.mon_command(json.dumps(cmd), b'', timeout=30)
+        eq(ret, 0, msg=out)
+        # create ec pool with profile created above
+        cmd = {'prefix': 'osd pool create', 'pg_num': 8, 'pgp_num': 8,
+               'pool': self.pool, 'pool_type': 'erasure', 
+               'erasure_code_profile': self.profile}
+        ret, buf, out = self.rados.mon_command(json.dumps(cmd), b'', timeout=30)
+        eq(ret, 0, msg=out)
+        assert self.rados.pool_exists(self.pool)
+        self.ioctx = self.rados.open_ioctx(self.pool)
+
+    def tearDown(self):
+        cmd = {"prefix": "osd unset", "key": "noup"}
+        self.rados.mon_command(json.dumps(cmd), b'')
+        self.ioctx.close()
+        self.rados.delete_pool(self.pool)
+        self.rados.shutdown()
+
+    def test_alignment(self):
+        eq(self.ioctx.alignment(), 8192)
+
 
 class TestIoctx2(object):
 
@@ -929,10 +963,6 @@ class TestIoctx2(object):
                    'num_objects_degraded': 0,
                    'num_rd': 0})
 
-    def test_change_auid(self):
-        self.ioctx2.change_auid(ANONYMOUS_AUID)
-        self.ioctx2.change_auid(ADMIN_AUID)
-
 
 class TestObject(object):
 
@@ -968,6 +998,43 @@ class TestObject(object):
         self.object.seek(0)
         eq(self.object.read(3), b'bar')
         eq(self.object.read(3), b'baz')
+
+class TestIoCtxSelfManagedSnaps(object):
+    def setUp(self):
+        self.rados = Rados(conffile='')
+        self.rados.connect()
+        self.rados.create_pool('test_pool')
+        assert self.rados.pool_exists('test_pool')
+        self.ioctx = self.rados.open_ioctx('test_pool')
+
+    def tearDown(self):
+        cmd = {"prefix":"osd unset", "key":"noup"}
+        self.rados.mon_command(json.dumps(cmd), b'')
+        self.ioctx.close()
+        self.rados.delete_pool('test_pool')
+        self.rados.shutdown()
+
+    def test(self):
+        # cannot mix-and-match pool and self-managed snapshot mode
+        self.ioctx.set_self_managed_snap_write([])
+        self.ioctx.write('abc', b'abc')
+        snap_id_1 = self.ioctx.create_self_managed_snap()
+        self.ioctx.set_self_managed_snap_write([snap_id_1])
+
+        self.ioctx.write('abc', b'def')
+        snap_id_2 = self.ioctx.create_self_managed_snap()
+        self.ioctx.set_self_managed_snap_write([snap_id_1, snap_id_2])
+
+        self.ioctx.write('abc', b'ghi')
+
+        self.ioctx.rollback_self_managed_snap('abc', snap_id_1)
+        eq(self.ioctx.read('abc'), b'abc')
+
+        self.ioctx.rollback_self_managed_snap('abc', snap_id_2)
+        eq(self.ioctx.read('abc'), b'def')
+
+        self.ioctx.remove_self_managed_snap(snap_id_1)
+        self.ioctx.remove_self_managed_snap(snap_id_2)
 
 class TestCommand(object):
 
@@ -1028,8 +1095,8 @@ class TestCommand(object):
         ret, buf, err = self.rados.osd_command(0, json.dumps(cmd), b'',
                                                timeout=30)
         eq(ret, 0)
-        assert len(err) > 0
-        out = json.loads(err)
+        assert len(buf) > 0
+        out = json.loads(buf.decode('utf-8'))
         eq(out['blocksize'], cmd['size'])
         eq(out['bytes_written'], cmd['count'])
 

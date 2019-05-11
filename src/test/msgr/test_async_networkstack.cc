@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <iostream>
+#include <list>
 #include <random>
 #include <string>
 #include <set>
@@ -24,34 +25,63 @@
 #include <gtest/gtest.h>
 
 #include "acconfig.h"
+#include "common/config_obs.h"
 #include "include/Context.h"
-
 #include "msg/async/Event.h"
 #include "msg/async/Stack.h"
 
 
-#if GTEST_HAS_PARAM_TEST
+class NoopConfigObserver : public md_config_obs_t {
+  std::list<std::string> options;
+  const char **ptrs = 0;
+
+public:
+  NoopConfigObserver(std::list<std::string> l) : options(l) {
+    ptrs = new const char*[options.size() + 1];
+    unsigned j = 0;
+    for (auto& i : options) {
+      ptrs[j++] = i.c_str();
+    }
+    ptrs[j] = 0;
+  }
+  ~NoopConfigObserver() {
+    delete[] ptrs;
+  }
+
+  const char** get_tracked_conf_keys() const override {
+    return ptrs;
+  }
+  void handle_conf_change(const ConfigProxy& conf,
+			  const std::set <std::string> &changed) override {
+  }
+};
 
 class NetworkWorkerTest : public ::testing::TestWithParam<const char*> {
  public:
   std::shared_ptr<NetworkStack> stack;
   string addr, port_addr;
 
+  NoopConfigObserver fake_obs = {{"ms_type",
+				 "ms_dpdk_coremask",
+				 "ms_dpdk_host_ipv4_addr",
+				 "ms_dpdk_gateway_ipv4_addr",
+				 "ms_dpdk_netmask_ipv4_addr"}};
+
   NetworkWorkerTest() {}
   void SetUp() override {
     cerr << __func__ << " start set up " << GetParam() << std::endl;
     if (strncmp(GetParam(), "dpdk", 4)) {
-      g_ceph_context->_conf->set_val("ms_type", "async+posix", false);
+      g_ceph_context->_conf.set_val("ms_type", "async+posix");
       addr = "127.0.0.1:15000";
       port_addr = "127.0.0.1:15001";
     } else {
-      g_ceph_context->_conf->set_val("ms_type", "async+dpdk", false);
-      g_ceph_context->_conf->set_val("ms_dpdk_debug_allow_loopback", "true", false);
-      g_ceph_context->_conf->set_val("ms_async_op_threads", "2", false);
-      g_ceph_context->_conf->set_val("ms_dpdk_coremask", "0x7", false);
-      g_ceph_context->_conf->set_val("ms_dpdk_host_ipv4_addr", "172.16.218.3", false);
-      g_ceph_context->_conf->set_val("ms_dpdk_gateway_ipv4_addr", "172.16.218.2", false);
-      g_ceph_context->_conf->set_val("ms_dpdk_netmask_ipv4_addr", "255.255.255.0", false);
+      g_ceph_context->_conf.set_val_or_die("ms_type", "async+dpdk");
+      g_ceph_context->_conf.set_val_or_die("ms_dpdk_debug_allow_loopback", "true");
+      g_ceph_context->_conf.set_val_or_die("ms_async_op_threads", "2");
+      g_ceph_context->_conf.set_val_or_die("ms_dpdk_coremask", "0x7");
+      g_ceph_context->_conf.set_val_or_die("ms_dpdk_host_ipv4_addr", "172.16.218.3");
+      g_ceph_context->_conf.set_val_or_die("ms_dpdk_gateway_ipv4_addr", "172.16.218.2");
+      g_ceph_context->_conf.set_val_or_die("ms_dpdk_netmask_ipv4_addr", "255.255.255.0");
       addr = "172.16.218.3:15000";
       port_addr = "172.16.218.3:15001";
     }
@@ -119,7 +149,7 @@ class C_poll : public EventCallback {
   static const int sleepus = 500;
 
  public:
-  C_poll(EventCenter *c): center(c), woken(false) {}
+  explicit C_poll(EventCenter *c): center(c), woken(false) {}
   void do_request(uint64_t r) override {
     woken = true;
   }
@@ -153,7 +183,7 @@ TEST_P(NetworkWorkerTest, SimpleTest) {
     EventCenter *center = &worker->center;
     ssize_t r = 0;
     if (stack->support_local_listen_table() || worker->id == 0)
-      r = worker->listen(bind_addr, options, &bind_socket);
+      r = worker->listen(bind_addr, 0, options, &bind_socket);
     ASSERT_EQ(0, r);
 
     ConnectedSocket cli_socket, srv_socket;
@@ -255,7 +285,7 @@ TEST_P(NetworkWorkerTest, ConnectFailedTest) {
     ServerSocket bind_socket;
     int r = 0;
     if (stack->support_local_listen_table() || worker->id == 0)
-      r = worker->listen(bind_addr, options, &bind_socket);
+      r = worker->listen(bind_addr, 0, options, &bind_socket);
     ASSERT_EQ(0, r);
 
     ConnectedSocket cli_socket1, cli_socket2;
@@ -296,10 +326,10 @@ TEST_P(NetworkWorkerTest, ListenTest) {
   ASSERT_TRUE(bind_addr.parse(get_addr().c_str()));
   SocketOptions options;
   ServerSocket bind_socket1, bind_socket2;
-  int r = worker->listen(bind_addr, options, &bind_socket1);
+  int r = worker->listen(bind_addr, 0, options, &bind_socket1);
   ASSERT_EQ(0, r);
 
-  r = worker->listen(bind_addr, options, &bind_socket2);
+  r = worker->listen(bind_addr, 0, options, &bind_socket2);
   ASSERT_EQ(-EADDRINUSE, r);
 }
 
@@ -318,7 +348,7 @@ TEST_P(NetworkWorkerTest, AcceptAndCloseTest) {
     {
       ServerSocket bind_socket;
       if (stack->support_local_listen_table() || worker->id == 0)
-        r = worker->listen(bind_addr, options, &bind_socket);
+        r = worker->listen(bind_addr, 0, options, &bind_socket);
       ASSERT_EQ(0, r);
 
       ConnectedSocket srv_socket, cli_socket;
@@ -425,7 +455,7 @@ TEST_P(NetworkWorkerTest, ComplexTest) {
     ServerSocket bind_socket;
     int r = 0;
     if (stack->support_local_listen_table() || worker->id == 0) {
-      r = worker->listen(bind_addr, options, &bind_socket);
+      r = worker->listen(bind_addr, 0, options, &bind_socket);
       ASSERT_EQ(0, r);
       *listen_p = true;
     }
@@ -567,7 +597,7 @@ class StressFactory {
     std::random_device rd;
     std::default_random_engine rng;
 
-    RandomString(size_t s): slen(s), rng(rd()) {}
+    explicit RandomString(size_t s): slen(s), rng(rd()) {}
     void prepare(size_t n) {
       static const char alphabet[] =
           "abcdefghijklmnopqrstuvwxyz"
@@ -625,7 +655,7 @@ class StressFactory {
   class C_delete : public EventCallback {
     T *ctxt;
    public:
-    C_delete(T *c): ctxt(c) {}
+    explicit C_delete(T *c): ctxt(c) {}
     void do_request(uint64_t id) override {
       delete ctxt;
       delete this;
@@ -650,7 +680,7 @@ class StressFactory {
     class Client_read_handle : public EventCallback {
       Client *c;
      public:
-      Client_read_handle(Client *_c): c(_c) {}
+      explicit Client_read_handle(Client *_c): c(_c) {}
       void do_request(uint64_t id) override {
         c->do_read_request();
       }
@@ -659,7 +689,7 @@ class StressFactory {
     class Client_write_handle : public EventCallback {
       Client *c;
      public:
-      Client_write_handle(Client *_c): c(_c) {}
+      explicit Client_write_handle(Client *_c): c(_c) {}
       void do_request(uint64_t id) override {
         c->do_write_request();
       }
@@ -789,7 +819,7 @@ class StressFactory {
     class Server_read_handle : public EventCallback {
       Server *s;
      public:
-      Server_read_handle(Server *_s): s(_s) {}
+      explicit Server_read_handle(Server *_s): s(_s) {}
       void do_request(uint64_t id) override {
         s->do_read_request();
       }
@@ -798,7 +828,7 @@ class StressFactory {
     class Server_write_handle : public EventCallback {
       Server *s;
      public:
-      Server_write_handle(Server *_s): s(_s) {}
+      explicit Server_write_handle(Server *_s): s(_s) {}
       void do_request(uint64_t id) override {
         s->do_write_request();
       }
@@ -934,7 +964,7 @@ class StressFactory {
   bool zero_copy_read;
   SocketOptions options;
 
-  explicit StressFactory(std::shared_ptr<NetworkStack> s, const string &addr,
+  explicit StressFactory(const std::shared_ptr<NetworkStack> &s, const string &addr,
                          size_t cli, size_t qd, size_t mc, size_t l, bool zero_copy)
       : stack(s), rs(128), client_num(cli), queue_depth(qd),
         max_message_length(l), message_count(mc), message_left(mc),
@@ -978,7 +1008,7 @@ class StressFactory {
     t_data.worker = worker;
     ServerSocket bind_socket;
     if (stack->support_local_listen_table() || worker->id == 0) {
-      r = worker->listen(bind_addr, options, &bind_socket);
+      r = worker->listen(bind_addr, 0, options, &bind_socket);
       ASSERT_EQ(0, r);
       already_bind = true;
     }
@@ -1034,7 +1064,7 @@ TEST_P(NetworkWorkerTest, StressTest) {
 }
 
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
   NetworkStack,
   NetworkWorkerTest,
   ::testing::Values(
@@ -1044,19 +1074,6 @@ INSTANTIATE_TEST_CASE_P(
     "posix"
   )
 );
-
-#else
-
-// Google Test may not support value-parameterized tests with some
-// compilers. If we use conditional compilation to compile out all
-// code referring to the gtest_main library, MSVC linker will not link
-// that library at all and consequently complain about missing entry
-// point defined in that library (fatal error LNK1561: entry point
-// must be defined). This dummy test keeps gtest_main linked in.
-TEST(DummyTest, ValueParameterizedTestsAreNotSupportedOnThisPlatform) {}
-
-#endif
-
 
 /*
  * Local Variables:

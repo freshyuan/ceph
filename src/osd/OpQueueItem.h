@@ -12,7 +12,6 @@
  *
  */
 
-
 #pragma once
 
 #include <ostream>
@@ -21,11 +20,10 @@
 #include "include/utime.h"
 #include "osd/OpRequest.h"
 #include "osd/PG.h"
-#include "common/mClockCommon.h"
-#include "messages/MOSDOp.h"
-
+#include "PGPeeringEvent.h"
 
 class OSD;
+class OSDShard;
 
 class OpQueueItem {
 public:
@@ -41,9 +39,11 @@ public:
   public:
     enum class op_type_t {
       client_op,
+      peering_event,
       bg_snaptrim,
       bg_recovery,
-      bg_scrub
+      bg_scrub,
+      bg_pg_delete
     };
     using Ref = std::unique_ptr<OpQueueable>;
 
@@ -55,27 +55,37 @@ public:
     virtual const spg_t& get_ordering_token() const = 0;
     virtual OrderLocker::Ref get_order_locker(PGRef pg) = 0;
     virtual op_type_t get_op_type() const = 0;
-    virtual boost::optional<OpRequestRef> maybe_get_op() const {
-      return boost::none;
+    virtual std::optional<OpRequestRef> maybe_get_op() const {
+      return std::nullopt;
     }
 
     virtual uint64_t get_reserved_pushes() const {
       return 0;
     }
 
+    virtual bool is_peering() const {
+      return false;
+    }
+    virtual bool peering_requires_pg() const {
+      ceph_abort();
+    }
+    virtual const PGCreateInfo *creates_pg() const {
+      return nullptr;
+    }
+
     virtual ostream &print(ostream &rhs) const = 0;
 
-    virtual void run(OSD *osd, PGRef& pg, ThreadPool::TPHandle &handle) = 0;
+    virtual void run(OSD *osd, OSDShard *sdata, PGRef& pg, ThreadPool::TPHandle &handle) = 0;
     virtual ~OpQueueable() {}
     friend ostream& operator<<(ostream& out, const OpQueueable& q) {
       return q.print(out);
     }
+
   };
 
 private:
   OpQueueable::Ref qitem;
   int cost;
-  dmc::ReqParams qos_params;
   unsigned priority;
   utime_t start_time;
   uint64_t owner;  ///< global id (e.g., client.XXX)
@@ -95,15 +105,7 @@ public:
       start_time(start_time),
       owner(owner),
       map_epoch(e)
-  {
-    if (auto op = maybe_get_op()) {
-      auto req = (*op)->get_req();
-      if (req->get_type() == CEPH_MSG_OSD_OP) {
-	const MOSDOp *m = static_cast<const MOSDOp*>(req);
-	qos_params = m->get_qos_params();
-      }
-    }
-  }
+  {}
   OpQueueItem(OpQueueItem &&) = default;
   OpQueueItem(const OpQueueItem &) = delete;
   OpQueueItem &operator=(OpQueueItem &&) = default;
@@ -122,29 +124,43 @@ public:
   OpQueueable::op_type_t get_op_type() const {
     return qitem->get_op_type();
   }
-  boost::optional<OpRequestRef> maybe_get_op() const {
+  std::optional<OpRequestRef> maybe_get_op() const {
     return qitem->maybe_get_op();
   }
   uint64_t get_reserved_pushes() const {
     return qitem->get_reserved_pushes();
   }
-  void run(OSD *osd, PGRef& pg, ThreadPool::TPHandle &handle) {
-    qitem->run(osd, pg, handle);
+  void run(OSD *osd, OSDShard *sdata,PGRef& pg, ThreadPool::TPHandle &handle) {
+    qitem->run(osd, sdata, pg, handle);
   }
   unsigned get_priority() const { return priority; }
   int get_cost() const { return cost; }
   utime_t get_start_time() const { return start_time; }
   uint64_t get_owner() const { return owner; }
   epoch_t get_map_epoch() const { return map_epoch; }
-  dmc::ReqParams get_qos_params() const { return qos_params; }
-  void set_qos_params(dmc::ReqParams qparams) { qos_params =  qparams; }
+
+  bool is_peering() const {
+    return qitem->is_peering();
+  }
+
+  const PGCreateInfo *creates_pg() const {
+    return qitem->creates_pg();
+  }
+
+  bool peering_requires_pg() const {
+    return qitem->peering_requires_pg();
+  }
 
   friend ostream& operator<<(ostream& out, const OpQueueItem& item) {
-    return out << "OpQueueItem("
-	       << item.get_ordering_token() << " " << *item.qitem
-	       << " prio " << item.get_priority()
-	       << " cost " << item.get_cost()
-	       << " e" << item.get_map_epoch() << ")";
+     out << "OpQueueItem("
+	 << item.get_ordering_token() << " " << *item.qitem
+	 << " prio " << item.get_priority()
+	 << " cost " << item.get_cost()
+	 << " e" << item.get_map_epoch();
+     if (item.get_reserved_pushes()) {
+       out << " reserved_pushes " << item.get_reserved_pushes();
+     }
+    return out << ")";
   }
 }; // class OpQueueItem
 
@@ -156,7 +172,7 @@ protected:
     return pgid;
   }
 public:
-  PGOpQueueable(spg_t pg) : pgid(pg) {}
+  explicit PGOpQueueable(spg_t pg) : pgid(pg) {}
   uint32_t get_queue_token() const override final {
     return get_pgid().ps();
   }
@@ -169,7 +185,7 @@ public:
     class Locker : public OpQueueItem::OrderLocker {
       PGRef pg;
     public:
-      Locker(PGRef pg) : pg(pg) {}
+      explicit Locker(PGRef pg) : pg(pg) {}
       void lock() override final {
 	pg->lock();
       }
@@ -185,17 +201,39 @@ public:
 class PGOpItem : public PGOpQueueable {
   OpRequestRef op;
 public:
-  PGOpItem(spg_t pg, OpRequestRef op) : PGOpQueueable(pg), op(op) {}
+  PGOpItem(spg_t pg, OpRequestRef op) : PGOpQueueable(pg), op(std::move(op)) {}
   op_type_t get_op_type() const override final {
     return op_type_t::client_op;
   }
   ostream &print(ostream &rhs) const override final {
     return rhs << "PGOpItem(op=" << *(op->get_req()) << ")";
   }
-  boost::optional<OpRequestRef> maybe_get_op() const override final {
+  std::optional<OpRequestRef> maybe_get_op() const override final {
     return op;
   }
-  void run(OSD *osd, PGRef& pg, ThreadPool::TPHandle &handle) override final;
+  void run(OSD *osd, OSDShard *sdata, PGRef& pg, ThreadPool::TPHandle &handle) override final;
+};
+
+class PGPeeringItem : public PGOpQueueable {
+  PGPeeringEventRef evt;
+public:
+  PGPeeringItem(spg_t pg, PGPeeringEventRef e) : PGOpQueueable(pg), evt(e) {}
+  op_type_t get_op_type() const override final {
+    return op_type_t::peering_event;
+  }
+  ostream &print(ostream &rhs) const override final {
+    return rhs << "PGPeeringEvent(" << evt->get_desc() << ")";
+  }
+  void run(OSD *osd, OSDShard *sdata, PGRef& pg, ThreadPool::TPHandle &handle) override final;
+  bool is_peering() const override {
+    return true;
+  }
+  bool peering_requires_pg() const override {
+    return evt->requires_pg;
+  }
+  const PGCreateInfo *creates_pg() const override {
+    return evt->create_info.get();
+  }
 };
 
 class PGSnapTrim : public PGOpQueueable {
@@ -214,7 +252,7 @@ public:
 	       << ")";
   }
   void run(
-    OSD *osd, PGRef& pg, ThreadPool::TPHandle &handle) override final;
+    OSD *osd, OSDShard *sdata, PGRef& pg, ThreadPool::TPHandle &handle) override final;
 };
 
 class PGScrub : public PGOpQueueable {
@@ -233,7 +271,7 @@ public:
 	       << ")";
   }
   void run(
-    OSD *osd, PGRef& pg, ThreadPool::TPHandle &handle) override final;
+    OSD *osd, OSDShard *sdata, PGRef& pg, ThreadPool::TPHandle &handle) override final;
 };
 
 class PGRecovery : public PGOpQueueable {
@@ -260,5 +298,45 @@ public:
     return reserved_pushes;
   }
   virtual void run(
-    OSD *osd, PGRef& pg, ThreadPool::TPHandle &handle) override final;
+    OSD *osd, OSDShard *sdata, PGRef& pg, ThreadPool::TPHandle &handle) override final;
+};
+
+class PGRecoveryContext : public PGOpQueueable {
+  unique_ptr<GenContext<ThreadPool::TPHandle&>> c;
+  epoch_t epoch;
+public:
+  PGRecoveryContext(spg_t pgid,
+		    GenContext<ThreadPool::TPHandle&> *c, epoch_t epoch)
+    : PGOpQueueable(pgid),
+      c(c), epoch(epoch) {}
+  op_type_t get_op_type() const override final {
+    return op_type_t::bg_recovery;
+  }
+  ostream &print(ostream &rhs) const override final {
+    return rhs << "PGRecoveryContext(pgid=" << get_pgid()
+	       << " c=" << c.get() << " epoch=" << epoch
+	       << ")";
+  }
+  void run(
+    OSD *osd, OSDShard *sdata, PGRef& pg, ThreadPool::TPHandle &handle) override final;
+};
+
+class PGDelete : public PGOpQueueable {
+  epoch_t epoch_queued;
+public:
+  PGDelete(
+    spg_t pg,
+    epoch_t epoch_queued)
+    : PGOpQueueable(pg),
+      epoch_queued(epoch_queued) {}
+  op_type_t get_op_type() const override final {
+    return op_type_t::bg_pg_delete;
+  }
+  ostream &print(ostream &rhs) const override final {
+    return rhs << "PGDelete(" << get_pgid()
+	       << " e" << epoch_queued
+	       << ")";
+  }
+  void run(
+    OSD *osd, OSDShard *sdata, PGRef& pg, ThreadPool::TPHandle &handle) override final;
 };

@@ -21,16 +21,16 @@
 
 
 class MMDSResolveAck : public Message {
- public:
+public:
   map<metareqid_t, bufferlist> commit;
   vector<metareqid_t> abort;
 
-  MMDSResolveAck() : Message(MSG_MDS_RESOLVEACK) {}
-private:
+protected:
+  MMDSResolveAck() : Message{MSG_MDS_RESOLVEACK} {}
   ~MMDSResolveAck() override {}
 
 public:
-  const char *get_type_name() const override { return "resolve_ack"; }
+  std::string_view get_type_name() const override { return "resolve_ack"; }
   /*void print(ostream& out) const {
     out << "resolve_ack.size()
 	<< "+" << ambiguous_imap.size()
@@ -46,14 +46,19 @@ public:
   }
 
   void encode_payload(uint64_t features) override {
-    ::encode(commit, payload);
-    ::encode(abort, payload);
+    using ceph::encode;
+    encode(commit, payload);
+    encode(abort, payload);
   }
   void decode_payload() override {
-    bufferlist::iterator p = payload.begin();
-    ::decode(commit, p);
-    ::decode(abort, p);
+    using ceph::decode;
+    auto p = payload.cbegin();
+    decode(commit, p);
+    decode(abort, p);
   }
+private:
+  template<class T, typename... Args>
+  friend boost::intrusive_ptr<T> ceph::make_message(Args&&... args);
 };
 
 #endif

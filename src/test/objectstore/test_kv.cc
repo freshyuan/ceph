@@ -27,8 +27,6 @@
 #include "include/stringify.h"
 #include <gtest/gtest.h>
 
-#if GTEST_HAS_PARAM_TEST
-
 class KVTest : public ::testing::TestWithParam<const char*> {
 public:
   boost::scoped_ptr<KeyValueDB> db;
@@ -208,7 +206,7 @@ struct AppendMOP : public KeyValueDB::MergeOperator {
   }
   // We use each operator name and each prefix to construct the
   // overall RocksDB operator name for consistency check at open time.
-  string name() const override {
+  const char *name() const override {
     return "Append";
   }
 };
@@ -319,7 +317,7 @@ TEST_P(KVTest, RocksDBColumnFamilyTest) {
   std::vector<KeyValueDB::ColumnFamily> cfs;
   cfs.push_back(KeyValueDB::ColumnFamily("cf1", ""));
   cfs.push_back(KeyValueDB::ColumnFamily("cf2", ""));
-  ASSERT_EQ(0, db->init(g_conf->bluestore_rocksdb_options));
+  ASSERT_EQ(0, db->init(g_conf()->bluestore_rocksdb_options));
   cout << "creating two column families and opening them" << std::endl;
   ASSERT_EQ(0, db->create_and_open(cout, cfs));
   {
@@ -374,7 +372,7 @@ TEST_P(KVTest, RocksDBIteratorTest) {
 
   std::vector<KeyValueDB::ColumnFamily> cfs;
   cfs.push_back(KeyValueDB::ColumnFamily("cf1", ""));
-  ASSERT_EQ(0, db->init(g_conf->bluestore_rocksdb_options));
+  ASSERT_EQ(0, db->init(g_conf()->bluestore_rocksdb_options));
   cout << "creating one column family and opening it" << std::endl;
   ASSERT_EQ(0, db->create_and_open(cout, cfs));
   {
@@ -427,7 +425,7 @@ TEST_P(KVTest, RocksDBCFMerge) {
     return; // No merge operators for this database type
   std::vector<KeyValueDB::ColumnFamily> cfs;
   cfs.push_back(KeyValueDB::ColumnFamily("cf1", ""));
-  ASSERT_EQ(0, db->init(g_conf->bluestore_rocksdb_options));
+  ASSERT_EQ(0, db->init(g_conf()->bluestore_rocksdb_options));
   cout << "creating one column family and opening it" << std::endl;
   ASSERT_EQ(0, db->create_and_open(cout, cfs));
 
@@ -467,35 +465,23 @@ TEST_P(KVTest, RocksDBCFMerge) {
   fini();
 }
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
   KeyValueDB,
   KVTest,
   ::testing::Values("leveldb", "rocksdb", "memdb"));
 
-#else
-
-// Google Test may not support value-parameterized tests with some
-// compilers. If we use conditional compilation to compile out all
-// code referring to the gtest_main library, MSVC linker will not link
-// that library at all and consequently complain about missing entry
-// point defined in that library (fatal error LNK1561: entry point
-// must be defined). This dummy test keeps gtest_main linked in.
-TEST(DummyTest, ValueParameterizedTestsAreNotSupportedOnThisPlatform) {}
-
-#endif
-
 int main(int argc, char **argv) {
   vector<const char*> args;
   argv_to_vec(argc, (const char **)argv, args);
-  env_to_vec(args);
 
   auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,
-			 CODE_ENVIRONMENT_UTILITY, 0);
+			 CODE_ENVIRONMENT_UTILITY,
+			 CINIT_FLAG_NO_DEFAULT_CONFIG_FILE);
   common_init_finish(g_ceph_context);
-  g_ceph_context->_conf->set_val(
+  g_ceph_context->_conf.set_val(
     "enable_experimental_unrecoverable_data_corrupting_features",
     "rocksdb, memdb");
-  g_ceph_context->_conf->apply_changes(NULL);
+  g_ceph_context->_conf.apply_changes(nullptr);
 
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

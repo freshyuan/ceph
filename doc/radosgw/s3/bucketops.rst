@@ -7,8 +7,6 @@ PUT Bucket
 Creates a new bucket. To create a bucket, you must have a user ID and a valid AWS Access Key ID to authenticate requests. You may not
 create buckets as an anonymous user.
 
-.. note:: We do not support request entities for ``PUT /{bucket}`` in this release.
-
 Constraints
 ~~~~~~~~~~~
 In general, bucket names should follow domain name constraints.
@@ -37,6 +35,16 @@ Parameters
 | ``x-amz-acl`` | Canned ACLs.         | ``private``, ``public-read``, ``public-read-write``, ``authenticated-read`` | No         |
 +---------------+----------------------+-----------------------------------------------------------------------------+------------+
 
+Request Entities
+~~~~~~~~~~~~~~~~
+
++-------------------------------+-----------+----------------------------------------------------------------+
+| Name                          | Type      | Description                                                    |
++===============================+===========+================================================================+
+| ``CreateBucketConfiguration`` | Container | A container for the bucket configuration.                      |
++-------------------------------+-----------+----------------------------------------------------------------+
+| ``LocationConstraint``        | String    | A zonegroup api name, with optional :ref:`s3_bucket_placement` |
++-------------------------------+-----------+----------------------------------------------------------------+
 
 
 HTTP Response
@@ -91,18 +99,19 @@ Syntax
 Parameters
 ~~~~~~~~~~
 
-+-----------------+-----------+-----------------------------------------------------------------------+
-| Name            | Type      | Description                                                           |
-+=================+===========+=======================================================================+
-| ``prefix``      | String    | Only returns objects that contain the specified prefix.               |
-+-----------------+-----------+-----------------------------------------------------------------------+
-| ``delimiter``   | String    | The delimiter between the prefix and the rest of the object name.     |
-+-----------------+-----------+-----------------------------------------------------------------------+
-| ``marker``      | String    | A beginning index for the list of objects returned.                   |
-+-----------------+-----------+-----------------------------------------------------------------------+
-| ``max-keys``    | Integer   | The maximum number of keys to return. Default is 1000.                |
-+-----------------+-----------+-----------------------------------------------------------------------+
-
++---------------------+-----------+-------------------------------------------------------------------------------------------------+
+| Name                | Type      | Description                                                                                     |
++=====================+===========+=================================================================================================+
+| ``prefix``          | String    | Only returns objects that contain the specified prefix.                                         |
++---------------------+-----------+-------------------------------------------------------------------------------------------------+
+| ``delimiter``       | String    | The delimiter between the prefix and the rest of the object name.                               |
++---------------------+-----------+-------------------------------------------------------------------------------------------------+
+| ``marker``          | String    | A beginning index for the list of objects returned.                                             |
++---------------------+-----------+-------------------------------------------------------------------------------------------------+
+| ``max-keys``        | Integer   | The maximum number of keys to return. Default is 1000.                                          |
++---------------------+-----------+-------------------------------------------------------------------------------------------------+
+| ``allow-unordered`` | Boolean   | Non-standard extension. Allows results to be returned unordered. Cannot be used with delimiter. |
++---------------------+-----------+-------------------------------------------------------------------------------------------------+
 
 HTTP Response
 ~~~~~~~~~~~~~
@@ -156,6 +165,8 @@ The ``ListBucketResult`` contains objects, where each object is within a ``Conte
 +------------------------+-----------+------------------------------------------+
 | ``StorageClass``       | String    | Should always return ``STANDARD``.       |
 +------------------------+-----------+------------------------------------------+
+| ``Type``               | String    | ``Appendable`` or ``Normal``.            |
++------------------------+-----------+------------------------------------------+
 
 Get Bucket Location
 -------------------
@@ -181,7 +192,7 @@ Response Entities
 | Name                   | Type      | Description                              |
 +========================+===========+==========================================+
 | ``LocationConstraint`` | String    | The region where bucket resides, empty   |
-|                        |           | string for defult region                 |
+|                        |           | string for default region                |
 +------------------------+-----------+------------------------------------------+
 
 

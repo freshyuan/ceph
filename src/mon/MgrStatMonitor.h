@@ -13,10 +13,12 @@ class MgrStatMonitor : public PaxosService {
   version_t version = 0;
   PGMapDigest digest;
   ServiceMap service_map;
+  std::map<std::string,ProgressEvent> progress_events;
 
   // pending commit
   PGMapDigest pending_digest;
   health_check_map_t pending_health_checks;
+  std::map<std::string,ProgressEvent> pending_progress_events;
   bufferlist pending_service_map_bl;
 
 public:
@@ -60,8 +62,12 @@ public:
 
   void update_logger();
 
-  const ServiceMap& get_service_map() {
+  const ServiceMap& get_service_map() const {
     return service_map;
+  }
+
+  const std::map<std::string,ProgressEvent>& get_progress_events() {
+    return progress_events;
   }
 
   // pg stat access
@@ -71,6 +77,10 @@ public:
       return &i->second;
     }
     return nullptr;
+  }
+
+  const PGMapDigest& get_digest() {
+    return digest;
   }
 
   ceph_statfs get_statfs(OSDMap& osdmap,
@@ -83,16 +93,15 @@ public:
   }
   void dump_info(Formatter *f) const {
     digest.dump(f);
+    f->dump_object("servicemap", get_service_map());
   }
-  void dump_fs_stats(stringstream *ss,
+  void dump_cluster_stats(stringstream *ss,
 		     Formatter *f,
 		     bool verbose) const {
-    digest.dump_fs_stats(ss, f, verbose);
+    digest.dump_cluster_stats(ss, f, verbose);
   }
   void dump_pool_stats(const OSDMap& osdm, stringstream *ss, Formatter *f,
 		       bool verbose) const {
     digest.dump_pool_stats_full(osdm, ss, f, verbose);
   }
-
-  friend class C_Updated;
 };

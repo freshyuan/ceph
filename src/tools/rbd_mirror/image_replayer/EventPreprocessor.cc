@@ -39,7 +39,7 @@ EventPreprocessor<I>::EventPreprocessor(I &local_image_ctx,
 
 template <typename I>
 EventPreprocessor<I>::~EventPreprocessor() {
-  assert(!m_in_progress);
+  ceph_assert(!m_in_progress);
 }
 
 template <typename I>
@@ -53,7 +53,7 @@ bool EventPreprocessor<I>::is_required(const EventEntry &event_entry) {
 template <typename I>
 void EventPreprocessor<I>::preprocess(EventEntry *event_entry,
                                       Context *on_finish) {
-  assert(!m_in_progress);
+  ceph_assert(!m_in_progress);
   m_in_progress = true;
   m_event_entry = event_entry;
   m_on_finish = on_finish;
@@ -147,7 +147,7 @@ void EventPreprocessor<I>::update_client() {
 
   librbd::journal::ClientData client_data(client_meta);
   bufferlist data_bl;
-  ::encode(client_data, data_bl);
+  encode(client_data, data_bl);
 
   Context *ctx = create_context_callback<
     EventPreprocessor<I>, &EventPreprocessor<I>::handle_update_client>(
@@ -174,7 +174,7 @@ template <typename I>
 bool EventPreprocessor<I>::prune_snap_map(SnapSeqs *snap_seqs) {
   bool pruned = false;
 
-  RWLock::RLocker snap_locker(m_local_image_ctx.snap_lock);
+  RWLock::RLocker image_locker(m_local_image_ctx.image_lock);
   for (auto it = snap_seqs->begin(); it != snap_seqs->end(); ) {
     auto current_it(it++);
     if (m_local_image_ctx.snap_info.count(current_it->second) == 0) {

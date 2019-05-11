@@ -33,20 +33,20 @@ public:
   static DeepCopyRequest* create(ImageCtxT *src_image_ctx,
                                  ImageCtxT *dst_image_ctx,
                                  librados::snap_t snap_id_start,
-                                 librados::snap_t snap_id_end,
+                                 librados::snap_t snap_id_end, bool flatten,
                                  const deep_copy::ObjectNumber &object_number,
                                  ContextWQ *work_queue,
                                  SnapSeqs *snap_seqs,
                                  ProgressContext *prog_ctx,
                                  Context *on_finish) {
     return new DeepCopyRequest(src_image_ctx, dst_image_ctx, snap_id_start,
-                               snap_id_end, object_number, work_queue,
+                               snap_id_end, flatten, object_number, work_queue,
                                snap_seqs, prog_ctx, on_finish);
   }
 
   DeepCopyRequest(ImageCtxT *src_image_ctx, ImageCtxT *dst_image_ctx,
                   librados::snap_t snap_id_start, librados::snap_t snap_id_end,
-                  const deep_copy::ObjectNumber &object_number,
+                  bool flatten, const deep_copy::ObjectNumber &object_number,
                   ContextWQ *work_queue, SnapSeqs *snap_seqs,
                   ProgressContext *prog_ctx, Context *on_finish);
   ~DeepCopyRequest();
@@ -62,9 +62,6 @@ private:
    *    |
    *    v
    * COPY_SNAPSHOTS
-   *    |
-   *    v
-   * SET_HEAD (skip if not needed)
    *    |
    *    v
    * COPY_IMAGE . . . . . . . . . . . . . .
@@ -91,6 +88,7 @@ private:
   ImageCtxT *m_dst_image_ctx;
   librados::snap_t m_snap_id_start;
   librados::snap_t m_snap_id_end;
+  bool m_flatten;
   deep_copy::ObjectNumber m_object_number;
   ContextWQ *m_work_queue;
   SnapSeqs *m_snap_seqs;
@@ -107,9 +105,6 @@ private:
 
   void send_copy_snapshots();
   void handle_copy_snapshots(int r);
-
-  void send_set_head();
-  void handle_set_head(int r);
 
   void send_copy_image();
   void handle_copy_image(int r);

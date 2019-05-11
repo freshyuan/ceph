@@ -4,10 +4,11 @@
 
 #include "global/global_init.h"
 #include "common/ceph_argparse.h"
+#include "common/ceph_releases.h"
+#include "common/ceph_strings.h"
 #include "global/global_context.h"
 #include "gtest/gtest.h"
 #include "include/ceph_features.h"
-#include "include/rados.h"
 
 
 TEST(features, release_features)
@@ -15,7 +16,8 @@ TEST(features, release_features)
   for (int r = 1; r < CEPH_RELEASE_MAX; ++r) {
     const char *name = ceph_release_name(r);
     ASSERT_NE(string("unknown"), name);
-    ASSERT_EQ(r, ceph_release_from_name(name));
+    ASSERT_EQ(ceph_release_t{static_cast<uint8_t>(r)},
+	      ceph_release_from_name(name));
     uint64_t features = ceph_release_features(r);
     int rr = ceph_release_from_features(features);
     cout << r << " " << name << " features 0x" << std::hex << features
@@ -36,7 +38,8 @@ int main(int argc, char **argv)
   argv_to_vec(argc, (const char **)argv, args);
 
   auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,
-			 CODE_ENVIRONMENT_UTILITY, 0);
+			 CODE_ENVIRONMENT_UTILITY,
+			 CINIT_FLAG_NO_DEFAULT_CONFIG_FILE);
   common_init_finish(g_ceph_context);
 
   ::testing::InitGoogleTest(&argc, argv);
